@@ -226,6 +226,12 @@ PLC_COIL_NG = 1                       # NG 线圈地址
 PLC_REG_RESULT = 100                  # 结果寄存器: 0=未检 1=OK 2=NG
 PLC_REG_HEARTBEAT = 101               # 心跳寄存器
 
+# ---------- 11. Arduino UNO 电磁阀对接 ----------
+ENABLE_UNO = True
+UNO_PORT = "COM6"
+UNO_BAUDRATE = 115200                # 必须与测试2.py/Arduino Serial.begin 一致
+UNO_PULSE_SECONDS = 0.10             # NG 时吸合时间，按现场电磁阀动作调整
+
 # =====================================================================================
 # ==============================  以下为业务逻辑, 现场无需改动  ==========================
 # =====================================================================================
@@ -1588,6 +1594,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     plc = ModbusReporter()
+    uno = None
+    if ENABLE_UNO:
+        try:
+            # 文件名含中文，但 Python 允许导入中文模块名。
+            from 测试2 import UnoRelayController
+            uno = UnoRelayController(
+                port=UNO_PORT,
+                baudrate=UNO_BAUDRATE,
+                pulse_seconds=UNO_PULSE_SECONDS,
+            )
+            if not uno.connect():
+                print("[WARN] UNO 未连接，视觉检测继续运行，但 NG 不会驱动电磁阀")
+                uno = None
+        except Exception as exc:                              # noqa: BLE001
+            print("[WARN] UNO 控制器初始化失败: %s" % exc)
+            uno = None
     n_ok = n_ng = n_bad = 0
     hit = miss = 0
     t_start = time.time()
@@ -1598,6 +1620,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if bgr is None:
                 n_bad += 1
                 print("[WARN] 帧无效, 按 NG 处理: %s" % name)
+                if uno is not None:
+                    uno.pulse()
                 plc.report(False)
                 continue
             if args.calib:
@@ -1606,6 +1630,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             res, proc = inspect(bgr, name)
             if PRINT_DEBUG:
                 print_result(res)
+            if uno is not None and not res.is_ok:
+                # 只对最终 NG 触发一次脉冲；OK 不发送 UNO 指令。
+                uno.pulse()
             saved = save_result_image(proc, res, overlay=True)
             if saved:
                 print("  存图: %s" % saved)
@@ -1620,6 +1647,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("\n[INFO] 已中断, 下面是本次汇总")
     getattr(source, "close", lambda: None)()                  # 直连: 断开(软触发时顺带发 StopRun)
     plc.close()
+    if uno is not None:
+        uno.close()
     if not args.calib:
         total = n_ok + n_ng
         print("=" * 108)
@@ -1633,4 +1662,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
