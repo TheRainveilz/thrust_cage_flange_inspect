@@ -1137,25 +1137,48 @@ def feature_b_corner_marks(gray: np.ndarray, hx: float, hy: float, r: float,
         in_frame += 1
         win, _ = crop_pad(gray, px, py, half)
         win = local_smooth(win)
+        # 保留原图作为 Hough 主路径，增强图只用于同一候选圆的圆度补偿。
+        # 这样不会因为 CLAHE 产生新的伪圆，只改善左暗右亮时的局部轮廓断裂。
+        win_enhanced = local_enhance(win)
         circles = cv2.HoughCircles(win, cv2.HOUGH_GRADIENT, dp=1.0, minDist=max(6, r_lo),
                                    param1=MARK_HOUGH_P1, param2=MARK_HOUGH_P2,
                                    minRadius=r_lo, maxRadius=r_hi)
         if circles is None:
             details.append(rec)
             continue
-        cand = [c for c in np.asarray(circles[0], dtype=np.float64)
+        all_cand = np.asarray(circles[0], dtype=np.float64)
+        cand = [c for c in all_cand
                 if np.hypot(c[0] - half, c[1] - half) <= MARK_CENTER_GATE * r]
+        dynamic_roi = False
+        if not cand:
+            dynamic_gate = 0.32
+            cand = [c for c in all_cand
+                    if np.hypot(c[0] - half, c[1] - half) <= dynamic_gate * r]
+            dynamic_roi = bool(cand)
         if not cand:
             details.append(rec)
             continue
         bx, by, br = cand[0]
-        circ = _best_mark_circularity(win, bx, by, br)
+        circ_raw = _best_mark_circularity(win, bx, by, br)
+        circ_enhanced = _best_mark_circularity(win_enhanced, bx, by, br)
+        circ = max(circ_raw, circ_enhanced)
+        center_offset = float(np.hypot(bx - half, by - half) / max(r, 1e-6))
+        radius_ratio = float(br / max(r, 1e-6))
+        position_ok = center_offset <= (0.32 if dynamic_roi else MARK_CENTER_GATE)
+        shape_ok = (0.28 <= radius_ratio <= 0.55 and
+                    circ_enhanced > 0.45 and circ_raw > 0.10)
         rec["circ"] = round(circ, 3)
-        rec["r"] = round(float(br) / r, 3)
+        rec["circ_raw"] = round(circ_raw, 3)
+        rec["circ_enhanced"] = round(circ_enhanced, 3)
+        rec["center_offset"] = round(center_offset, 3)
+        rec["radius_ratio"] = round(radius_ratio, 3)
+        rec["shape_ok"] = bool(shape_ok)
+        rec["dynamic_roi"] = bool(dynamic_roi)
+        rec["r"] = round(radius_ratio, 3)
         rec["mark_cx"] = px + (bx - half)
         rec["mark_cy"] = py + (by - half)
         rec["mark_r"] = float(br)
-        if circ > MARK_CIRCULARITY_MIN:
+        if circ_raw > MARK_CIRCULARITY_MIN or (position_ok and shape_ok):
             rec["ok"] = True
             valid += 1
         details.append(rec)
