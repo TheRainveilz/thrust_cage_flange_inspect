@@ -1532,6 +1532,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                     help="camera 模式的触发方式: external=IO 外部硬触发(上线, 被动等帧), "
                          "MainRunOnce=软触发(台上调试), ContinuousImageCapture=连续预览(调光)")
     ap.add_argument("--debug", action="store_true", help="额外保存叠加调试图(OK 也存)")
+    ap.add_argument("--save-ok", dest="save_ok", action="store_true",
+                    help="同时保存 OK 图片；可与 --no-overlay 组合保存 OK/NG 原图")
     ap.add_argument("--calib", action="store_true", help="拐角角度/尺寸标定模式(换型用)")
     ap.add_argument("--collect", metavar="DIR", default=None,
                     help="采样模式(标阈值/重标定用): 等价于 --save-dir DIR --no-overlay "
@@ -1555,7 +1557,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     global SAVE_OK_IMAGE, HOLE_CHECK_COUNT, CAM_TRIGGER_ORDER, CAM_MAX_FRAMES
     global SAVE_OVERLAY, SAVE_IMAGE_EXT, OK_SAVE_DIR, NG_SAVE_DIR
-    if args.debug:
+    if args.debug or args.save_ok:
         SAVE_OK_IMAGE = True
     if args.holes is not None:
         HOLE_CHECK_COUNT = args.holes
@@ -1575,7 +1577,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if save_root:
         OK_SAVE_DIR = os.path.join(save_root, "OK")
         NG_SAVE_DIR = os.path.join(save_root, "NG")
-    if args.collect or args.no_overlay or args.save_ext or save_root:
+    if args.collect or args.no_overlay or args.save_ok or args.save_ext or save_root:
         where = (os.path.join(os.path.abspath(save_root), "{OK,NG}") if save_root
                  else "%s + %s" % (OK_SAVE_DIR, NG_SAVE_DIR))
         print("[INFO] 存图 %s | 格式 %s | %s"
