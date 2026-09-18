@@ -226,11 +226,12 @@ PLC_COIL_NG = 1                       # NG 线圈地址
 PLC_REG_RESULT = 100                  # 结果寄存器: 0=未检 1=OK 2=NG
 PLC_REG_HEARTBEAT = 101               # 心跳寄存器
 
-# ---------- 11. Arduino UNO 电磁阀对接 ----------
+# ---------- 11. Arduino UNO PLC对接 ----------
 ENABLE_UNO = True
 UNO_PORT = "COM6"
-UNO_BAUDRATE = 115200                # 必须与测试2.py/Arduino Serial.begin 一致
-UNO_PULSE_SECONDS = 0.10             # NG 时吸合时间，按现场电磁阀动作调整
+UNO_PIN = 8                         # Arduino UNO 输出引脚，当前接 PLC X12
+UNO_BAUDRATE = 9600                  # 必须与测试2.py/Arduino Serial.begin 一致
+UNO_PULSE_SECONDS = 0.05             # UNO 固定NG脉冲时间，仅用于日志
 
 # =====================================================================================
 # ==============================  以下为业务逻辑, 现场无需改动  ==========================
@@ -1601,6 +1602,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from 测试2 import UnoRelayController
             uno = UnoRelayController(
                 port=UNO_PORT,
+                pin=UNO_PIN,
                 baudrate=UNO_BAUDRATE,
                 pulse_seconds=UNO_PULSE_SECONDS,
             )
