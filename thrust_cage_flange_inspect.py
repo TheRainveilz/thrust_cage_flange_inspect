@@ -146,7 +146,7 @@ PITCH_FIT_TOL_RATIO = 0.06            # 内点容差 / 节圆半径
 PITCH_FIT_TOL_MIN_PX = 8.0            # 内点容差下限(px)
 OUTER_R_MIN_RATIO = 0.18              # 兜底: 外圆/中心大孔 Hough 半径范围 / 图像宽度
 OUTER_R_MAX_RATIO = 0.60
-OUTER_HOUGH_P2 = 60
+OUTER_HOUGH_P2 = 90
 
 # ---------- 5. 孔心精定位 (径向 50% 灰度跨越 + 圆拟合) ----------
 REFINE_ANGLE_STEP_DEG = 2.0           # 射线角度步长(度)
@@ -189,6 +189,8 @@ CORNER_SPEC = ((-131.0, 1.58), (-59.5, 1.79), (60.0, 1.79), (131.0, 1.58))
 CORNER_WIN_RATIO = 0.75               # 拐角微小 ROI 半宽 / r
 MARK_R_RATIO_RANGE = (0.28, 0.55)     # 压痕半径 / r 允许范围 (实测中位数 ≈0.38)
 MARK_HOUGH_P1 = 110
+MARK_MAX_CANDIDATES = 5
+MARK_DEDUP_DIST_RATIO = 0.18
 MARK_HOUGH_P2 = 16                    # 压痕 Hough 累加器阈值: 形状级预筛, 非圆毛刺无响应
 MARK_CENTER_GATE = 0.22               # 压痕圆心允许偏离拐角 ROI 中心 / r (实测定位重复性 σ≈0.08)
 MARK_MASK_RATIO = 1.25                # 圆度计算时的圆形裁剪掩膜半径 / 压痕半径
@@ -1100,6 +1102,31 @@ def _best_mark_circularity(win: np.ndarray, bx: float, by: float, br: float) -> 
     return best
 
 
+def _dedup_mark_candidates(candidates: np.ndarray, half: int, r: float) -> List[np.ndarray]:
+    """Keep distinct Hough candidates and cap expensive circularity checks."""
+    if candidates is None or len(candidates) == 0:
+        return []
+    ordered = sorted(
+        (np.asarray(c, dtype=np.float64) for c in candidates),
+        key=lambda c: (
+            np.hypot(c[0] - half, c[1] - half) / max(r, 1e-6),
+            abs(c[2] / max(r, 1e-6) - 0.38),
+        ),
+    )
+    kept: List[np.ndarray] = []
+    min_dist = MARK_DEDUP_DIST_RATIO * r
+    for c in ordered:
+        ratio = c[2] / max(r, 1e-6)
+        if not (0.20 <= ratio <= 0.70):
+            continue
+        if any(np.hypot(c[0] - old[0], c[1] - old[1]) < min_dist for old in kept):
+            continue
+        kept.append(c)
+        if len(kept) >= MARK_MAX_CANDIDATES:
+            break
+    return kept
+
+
 def feature_b_corner_marks(gray: np.ndarray, hx: float, hy: float, r: float,
                            part_cx: float, part_cy: float,
                            corner_spec: Sequence[Tuple[float, float]] = CORNER_SPEC
@@ -1158,29 +1185,42 @@ def feature_b_corner_marks(gray: np.ndarray, hx: float, hy: float, r: float,
         if not cand:
             details.append(rec)
             continue
-        bx, by, br = cand[0]
-        circ_raw = _best_mark_circularity(win, bx, by, br)
-        circ_enhanced = _best_mark_circularity(win_enhanced, bx, by, br)
-        circ = max(circ_raw, circ_enhanced)
-        center_offset = float(np.hypot(bx - half, by - half) / max(r, 1e-6))
-        radius_ratio = float(br / max(r, 1e-6))
-        position_ok = center_offset <= (0.32 if dynamic_roi else MARK_CENTER_GATE)
-        shape_ok = (0.28 <= radius_ratio <= 0.55 and
-                    circ_enhanced > 0.45 and circ_raw > 0.10)
-        rec["circ"] = round(circ, 3)
-        rec["circ_raw"] = round(circ_raw, 3)
-        rec["circ_enhanced"] = round(circ_enhanced, 3)
-        rec["center_offset"] = round(center_offset, 3)
-        rec["radius_ratio"] = round(radius_ratio, 3)
-        rec["shape_ok"] = bool(shape_ok)
-        rec["dynamic_roi"] = bool(dynamic_roi)
-        rec["r"] = round(radius_ratio, 3)
-        rec["mark_cx"] = px + (bx - half)
-        rec["mark_cy"] = py + (by - half)
-        rec["mark_r"] = float(br)
-        if circ_raw > MARK_CIRCULARITY_MIN or (position_ok and shape_ok):
-            rec["ok"] = True
-            valid += 1
+        best = None
+        for bx, by, br in _dedup_mark_candidates(
+                np.asarray(cand, dtype=np.float64), half, r):
+            circ_raw = _best_mark_circularity(win, bx, by, br)
+            circ_enhanced = _best_mark_circularity(win_enhanced, bx, by, br)
+            circ = max(circ_raw, circ_enhanced)
+            center_offset = float(np.hypot(bx - half, by - half) / max(r, 1e-6))
+            radius_ratio = float(br / max(r, 1e-6))
+            position_ok = center_offset <= (0.32 if dynamic_roi else MARK_CENTER_GATE)
+            shape_ok = (0.28 <= radius_ratio <= 0.55 and
+                        circ_enhanced > 0.45 and circ_raw > 0.10)
+            accepted = bool(circ_raw > MARK_CIRCULARITY_MIN or
+                            (position_ok and shape_ok))
+            score = (accepted, circ_raw + circ_enhanced,
+                     -center_offset, -abs(radius_ratio - 0.38))
+            if best is None or score > best[0]:
+                best = (score, bx, by, br, circ_raw, circ_enhanced,
+                        circ, center_offset, radius_ratio, shape_ok, accepted)
+
+        if best is not None:
+            (_, bx, by, br, circ_raw, circ_enhanced, circ,
+             center_offset, radius_ratio, shape_ok, accepted) = best
+            rec["circ"] = round(circ, 3)
+            rec["circ_raw"] = round(circ_raw, 3)
+            rec["circ_enhanced"] = round(circ_enhanced, 3)
+            rec["center_offset"] = round(center_offset, 3)
+            rec["radius_ratio"] = round(radius_ratio, 3)
+            rec["shape_ok"] = bool(shape_ok)
+            rec["dynamic_roi"] = bool(dynamic_roi)
+            rec["r"] = round(radius_ratio, 3)
+            rec["mark_cx"] = px + (bx - half)
+            rec["mark_cy"] = py + (by - half)
+            rec["mark_r"] = float(br)
+            if accepted:
+                rec["ok"] = True
+                valid += 1
         details.append(rec)
     return valid, in_frame, details
 
