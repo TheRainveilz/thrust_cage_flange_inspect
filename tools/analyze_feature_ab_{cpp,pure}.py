@@ -1,17 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""批量统计现有视觉算法的特征 A / 特征 B 通过率。
+"""批量统计视觉算法的特征 A / 特征 B 通过率（纯 Py 与 C++ 加速版合一）。
 
-示例:
-    python analyze_feature_ab.py --dir "D:\\zq\\imageData"
-    python analyze_feature_ab.py --dir "D:\\zq\\imageData" --holes 0 --csv "D:\\zq\\ab.csv"
+用 --impl 选择实现，两版算法共用同一套统计逻辑：
+    python tools/analyze_feature_ab.py --impl pure --dir "D:\\zq\\imageData" --holes 0
+    python tools/analyze_feature_ab.py --impl cpp  --dir "D:\\zq\\imageData" --holes 0
 
-目录可以是:
-    imageData/OK/*.png
-    imageData/NG/*.png
+CSV 输出：
+    不传 --csv 时，自动写到 --outdir(默认 artifacts/reports/)，
+    文件名为 ab_<impl>_holes<N>_<YYYYmmdd>.csv；
+    传 --csv 则完全用它作为落盘路径(忽略 --outdir 自动命名)。
 
-也支持直接传入包含图片的目录。标签无法从父目录推断时记为 UNKNOWN，
-不影响整体统计。
+目录可以是 imageData/OK/*.png、imageData/NG/*.png，或直接含图片的目录。
+标签无法从父目录推断时记为 UNKNOWN，不影响整体统计。
 """
 
 from __future__ import annotations
@@ -19,16 +20,36 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Iterable, List
 
 import cv2
 
-import thrust_cage_flange_inspect as T
+# 允许从任意工作目录运行：把仓库根(tools/ 的上一级)加入 sys.path，
+# 以便 import src.flange_inspect。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+# 默认输出锚定到项目根(而非运行时 cwd)：无论从哪个目录调用，
+# 不传 --csv 时都会落到 <项目根>/artifacts/reports/。
+DEFAULT_OUTDIR = os.path.join(_REPO_ROOT, "artifacts", "reports")
+
+
+def load_impl(impl: str):
+    """按 --impl 返回对应算法模块(纯 Py 或 C++ 加速版)。"""
+    if impl == "cpp":
+        from src.flange_inspect import inspector_cpp as T
+    elif impl == "pure":
+        from src.flange_inspect import inspector as T
+    else:
+        raise ValueError("--impl 只能是 pure 或 cpp: %r" % impl)
+    return T
 
 
 @dataclass
@@ -48,17 +69,32 @@ class ImageStat:
     max_marks: int = 0
     ring_counts: str = ""
     marks: str = ""
+    elapsed_ms: float = 0.0
     error: str = ""
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="统计视觉检测特征 A/B 通过率")
+    ap.add_argument("--impl", choices=("pure", "cpp"), default="pure",
+                    help="算法实现: pure=纯 Python, cpp=C++ 加速版(默认 pure)")
     ap.add_argument("--dir", required=True, help="图片目录，支持 OK/NG 子目录")
-    ap.add_argument("--csv", default=None, help="输出逐图 CSV 路径")
+    ap.add_argument("--csv", default=None,
+                    help="输出逐图 CSV 完整路径；不传则按 --outdir 自动命名")
+    ap.add_argument("--outdir", default=DEFAULT_OUTDIR,
+                    help="不传 --csv 时的 CSV 输出目录(默认 artifacts/reports/)")
     ap.add_argument("--holes", type=int, default=None,
                     help="参与统计的孔数；0=全部孔；默认使用主程序当前配置")
     ap.add_argument("--limit", type=int, default=0, help="最多处理多少张；0=全部")
     return ap.parse_args()
+
+
+def resolve_csv_path(args: argparse.Namespace, holes: int) -> str:
+    """确定 CSV 落盘路径：优先 --csv，否则 outdir/ab_<impl>_holes<N>_<date>.csv。"""
+    if args.csv:
+        return args.csv
+    stamp = datetime.now().strftime("%Y%m%d")
+    name = "ab_%s_holes%d_%s.csv" % (args.impl, holes, stamp)
+    return os.path.join(args.outdir, name)
 
 
 def iter_images(root: str) -> Iterable[str]:
@@ -86,7 +122,7 @@ def infer_label(path: str) -> str:
     return "UNKNOWN"
 
 
-def inspect_one(path: str) -> ImageStat:
+def inspect_one(T, path: str) -> ImageStat:
     label = infer_label(path)
     bgr = T.imread_unicode(path, cv2.IMREAD_COLOR)
     if bgr is None:
@@ -95,6 +131,9 @@ def inspect_one(path: str) -> ImageStat:
     try:
         result, _ = T.inspect(bgr, os.path.basename(path))
     except Exception as exc:  # noqa: BLE001
+        import traceback
+        print(f"\n[TRACEBACK] {path}")
+        traceback.print_exc()
         return ImageStat(path, label, "EXCEPTION", "", "", error=str(exc))
 
     checked = [h for h in result.holes if h.index in set(result.checked)]
@@ -124,6 +163,7 @@ def inspect_one(path: str) -> ImageStat:
         max_marks=max((h.valid_marks for h in checked), default=0),
         ring_counts=ring_counts,
         marks=marks,
+        elapsed_ms=float(result.elapsed_ms),
     )
 
 
@@ -141,6 +181,7 @@ def print_group(title: str, rows: List[ImageStat]) -> None:
     a_holes = sum(r.a_pass for r in valid)
     b_holes = sum(r.b_pass for r in valid)
     pair_holes = sum(r.pair_pass for r in valid)
+    times = [r.elapsed_ms for r in valid]
 
     print(f"\n[{title}] 图片 {len(rows)} 张，成功分析 {len(valid)} 张")
     print("  图片级: A通过=%d/%d (%s) | B通过=%d/%d (%s) | A+B同时通过=%d/%d (%s)"
@@ -151,6 +192,10 @@ def print_group(title: str, rows: List[ImageStat]) -> None:
           % (a_holes, holes, pct(a_holes, holes),
              b_holes, holes, pct(b_holes, holes),
              pair_holes, holes, pct(pair_holes, holes)))
+
+    if times:
+        print("  elapsed_ms: avg=%.1f min=%.1f max=%.1f"
+              % (sum(times) / len(times), min(times), max(times)))
 
     combos = Counter()
     for row in valid:
@@ -179,6 +224,7 @@ def write_csv(path: str, rows: List[ImageStat]) -> None:
 
 def main() -> int:
     args = parse_args()
+    T = load_impl(args.impl)
     if args.holes is not None:
         T.HOLE_CHECK_COUNT = args.holes
 
@@ -189,19 +235,20 @@ def main() -> int:
         print("[ERROR] 未找到图片:", args.dir)
         return 2
 
+    print("[INFO] 实现:", args.impl)
     print("[INFO] 图片数:", len(paths))
     print("[INFO] HOLE_CHECK_COUNT:", T.HOLE_CHECK_COUNT)
     rows = []
     for index, path in enumerate(paths, 1):
-        row = inspect_one(path)
+        row = inspect_one(T, path)
         rows.append(row)
         if row.error:
             print("[WARN] %d/%d %s: %s" % (index, len(paths), path, row.error))
         else:
-            print("[%d/%d] %-7s %-3s checked=%d A=%d/%d B=%d/%d pair=%d/%d"
+            print("[%d/%d] %-7s %-3s checked=%d A=%d/%d B=%d/%d pair=%d/%d %.1fms"
                   % (index, len(paths), row.label, row.verdict, row.checked,
-                     row.a_pass, row.checked, row.b_pass, row.checked,
-                     row.pair_pass, row.checked))
+                      row.a_pass, row.checked, row.b_pass, row.checked,
+                      row.pair_pass, row.checked, row.elapsed_ms))
 
     groups: Dict[str, List[ImageStat]] = defaultdict(list)
     for row in rows:
@@ -211,9 +258,9 @@ def main() -> int:
             print_group(label, groups[label])
     print_group("全部", rows)
 
-    if args.csv:
-        write_csv(args.csv, rows)
-        print("\n[INFO] 明细 CSV:", os.path.abspath(args.csv))
+    csv_path = resolve_csv_path(args, T.HOLE_CHECK_COUNT)
+    write_csv(csv_path, rows)
+    print("\n[INFO] 明细 CSV:", os.path.abspath(csv_path))
     return 0
 
 
