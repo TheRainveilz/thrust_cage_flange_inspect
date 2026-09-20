@@ -5,8 +5,8 @@ import time
 # =========================
 # Arduino 串口配置
 # =========================
-PORT = "COM6"
-BAUDRATE = 9600
+PORT = "COM7"
+BAUDRATE = 115200
 
 try:
     arduino = serial.Serial(
