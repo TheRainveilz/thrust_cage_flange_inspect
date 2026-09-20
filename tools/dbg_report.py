@@ -54,7 +54,7 @@ from src.flange_inspect import inspector as T
 # 主文件一旦重构, 宁可启动就炸, 也不要画出位置错误的框还看着挺像。
 REQ_FUNCS = ("inspect", "crop_pad", "local_smooth", "local_enhance", "find_contours",
              "circularity", "_best_mark_circularity", "guess_label", "imwrite_unicode",
-             "setup_console", "LocalFolderSource")
+             "setup_console", "LocalFolderSource", "print_result", "preprocess")
 REQ_CONSTS = ("CORNER_SPEC", "CORNER_WIN_RATIO", "MARK_R_RATIO_RANGE", "MARK_HOUGH_P1",
               "MARK_HOUGH_P2", "MARK_CENTER_GATE", "MARK_MASK_RATIO", "MARK_THRESH_PCTS",
               "MARK_MIN_AREA_RATIO", "MARK_CIRCULARITY_MIN", "MIN_VALID_MARKS",
@@ -169,51 +169,58 @@ def hough_candidates(win: np.ndarray, r: float) -> np.ndarray:
     return np.asarray(circles[0], dtype=np.float64)
 
 
-def sweep_circularity(win: np.ndarray, bx: float, by: float, br: float) -> dict:
+def sweep_circularity(win: np.ndarray, win_enh: Optional[np.ndarray],
+                      bx: float, by: float, br: float) -> dict:
     """复刻 T._best_mark_circularity 的多阈值循环, 额外带出赢的阈值/掩膜/轮廓与逐阈值曲线。
 
-    这是本工具唯一重写的一段逻辑(模块只返回标量, 赢的掩膜在函数里就丢了)。
-    调用方用 verify 断言 best == 模块记录的 circ, 把"实现分叉"从静默风险变成显式报错。
+    主模块现在对同一候选圆算两遍圆度: 平滑窗口(circ_raw)与全局 CLAHE 窗口(circ_enhanced),
+    记录 circ = max(raw, enhanced)。这里对两张窗口各跑一遍同一套多阈值循环, 取全局最优,
+    并记住赢的是哪张窗口(src) —— verify 据此断言 best == 模块记录的 circ(那个 max)。
+    模块只返回标量、赢的掩膜在函数里就丢了, 所以这段是本工具必须重写的部分。
     """
     mask = np.zeros(win.shape[:2], np.uint8)
     cv2.circle(mask, (int(round(bx)), int(round(by))),
                max(2, int(round(T.MARK_MASK_RATIO * br))), 255, -1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     min_area = T.MARK_MIN_AREA_RATIO * float(np.pi) * br * br
-    best, win_q, win_flag, win_bw, win_cnt = 0.0, None, None, None, None
+    best, win_q, win_flag, win_bw, win_cnt, win_src = 0.0, None, None, None, None, None
     curve: List[float] = []
     n_pass = 0
-    for q in np.percentile(win, T.MARK_THRESH_PCTS):
-        per_q = 0.0
-        for flag in (cv2.THRESH_BINARY_INV, cv2.THRESH_BINARY):
-            _, bw = cv2.threshold(win, float(q), 255, flag)
-            bw = cv2.bitwise_and(bw, mask)
-            bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
-            bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
-            local, local_cnt = 0.0, None
-            for cnt in T.find_contours(bw, cv2.RETR_EXTERNAL):
-                if cv2.contourArea(cnt) < min_area:
-                    continue
-                if cv2.pointPolygonTest(cnt, (float(bx), float(by)), False) < 0:
-                    continue                                  # 必须包住 Hough 圆心
-                v = T.circularity(cnt)
-                if v > local:
-                    local, local_cnt = v, cnt
-            n_pass += int(local > T.MARK_CIRCULARITY_MIN)
-            per_q = max(per_q, local)
-            if local > best:
-                best, win_q, win_flag, win_bw, win_cnt = local, float(q), flag, bw.copy(), local_cnt
-        curve.append(per_q)
+    windows = [("raw", win)] + ([("enh", win_enh)] if win_enh is not None else [])
+    for src_name, w_img in windows:
+        for q in np.percentile(w_img, T.MARK_THRESH_PCTS):
+            per_q = 0.0
+            for flag in (cv2.THRESH_BINARY_INV, cv2.THRESH_BINARY):
+                _, bw = cv2.threshold(w_img, float(q), 255, flag)
+                bw = cv2.bitwise_and(bw, mask)
+                bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
+                bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
+                local, local_cnt = 0.0, None
+                for cnt in T.find_contours(bw, cv2.RETR_EXTERNAL):
+                    if cv2.contourArea(cnt) < min_area:
+                        continue
+                    if cv2.pointPolygonTest(cnt, (float(bx), float(by)), False) < 0:
+                        continue                              # 必须包住 Hough 圆心
+                    v = T.circularity(cnt)
+                    if v > local:
+                        local, local_cnt = v, cnt
+                n_pass += int(local > T.MARK_CIRCULARITY_MIN)
+                per_q = max(per_q, local)
+                if local > best:
+                    best, win_q, win_flag, win_bw, win_cnt, win_src = \
+                        local, float(q), flag, bw.copy(), local_cnt, src_name
+            curve.append(per_q)
     return {"best": best, "q": win_q, "flag": win_flag, "bw": win_bw,
-            "cnt": win_cnt, "curve": curve, "n_pass": n_pass,
-            "n_combo": 2 * len(T.MARK_THRESH_PCTS)}
+            "cnt": win_cnt, "src": win_src, "curve": curve, "n_pass": n_pass,
+            "n_combo": 2 * len(T.MARK_THRESH_PCTS) * len(windows)}
 
 
 class VerifyError(RuntimeError):
     """复刻的分割循环与主模块结果不一致 —— 拼图会画错, 必须停下来。"""
 
 
-def classify_corner(gray: np.ndarray, hole, rec: dict, verify: bool = True) -> dict:
+def classify_corner(gray: np.ndarray, clahe_only: Optional[np.ndarray],
+                    hole, rec: dict, verify: bool = True) -> dict:
     """把单个拐角判成 6 种 stage 之一, 并带回画面板需要的全部素材。"""
     out = {"stage": "oof", "win": None, "half": 0, "hough_n": "",
            "cands": None, "bx": None, "by": None, "br": None, "sweep": None}
@@ -221,6 +228,10 @@ def classify_corner(gray: np.ndarray, hole, rec: dict, verify: bool = True) -> d
         return out
     win, half = corner_window(gray, hole, rec)
     out["win"], out["half"] = win, half
+    # 增强窗口: 与主模块一致, 从全局 clahe_only 直接 crop_pad, 不做 local_smooth。
+    win_enh = None
+    if clahe_only is not None:
+        win_enh, _ = T.crop_pad(clahe_only, rec["cx"], rec["cy"], half)
 
     if "mark_r" in rec:
         # 反推检测时的 Hough 候选圆(模块记的是图像坐标, 这里换回窗口坐标)。
@@ -230,7 +241,7 @@ def classify_corner(gray: np.ndarray, hole, rec: dict, verify: bool = True) -> d
         bx = float(np.float32(float(rec["mark_cx"]) - float(rec["cx"]) + half))
         by = float(np.float32(float(rec["mark_cy"]) - float(rec["cy"]) + half))
         br = float(rec["mark_r"])
-        sw = sweep_circularity(win, bx, by, br)
+        sw = sweep_circularity(win, win_enh, bx, by, br)
         out.update({"bx": bx, "by": by, "br": br, "sweep": sw})
         if verify and abs(round(sw["best"], 3) - float(rec["circ"])) > 1e-9:
             # 比"再调一次 _best_mark_circularity"更强: 同时校验了窗口复现与 bx/by/br 反推
@@ -367,7 +378,8 @@ def panel_corner_diag(rec: dict, ana: dict, hole) -> np.ndarray:
         if sw["cnt"] is not None:
             cv2.drawContours(vis, [(sw["cnt"].astype(np.float32) * s).astype(np.int32)], -1, GREEN, 1)
         pol = "INV" if sw["flag"] == cv2.THRESH_BINARY_INV else "BIN"
-        label(vis, "q=%.0f %s best=%.2f" % (sw["q"], pol, sw["best"]), color=STAGE_COLOR[stage])
+        label(vis, "q=%.0f %s %s best=%.2f" % (sw["q"], pol, sw.get("src") or "-", sw["best"]),
+              color=STAGE_COLOR[stage])
         label(vis, "margin %d/%d combos" % (sw["n_pass"], sw["n_combo"]), y=29,
               color=GREEN if sw["n_pass"] >= 4 else ORANGE)
         return vis
@@ -452,7 +464,8 @@ CSV_HEADER = ("image", "truth", "verdict", "reason", "elapsed_ms", "locate", "pi
               "hole_valid_marks", "corners_in_frame", "feature_b", "hole_passed")
 
 
-def analyse_image(gray: np.ndarray, res, truth: Optional[bool], verify: bool
+def analyse_image(gray: np.ndarray, clahe_only: Optional[np.ndarray], res,
+                  truth: Optional[bool], verify: bool
                   ) -> Tuple[List[list], List[Tuple[object, List[dict]]]]:
     """跑完一张图的拐角复算, 同时产出 CSV 行与拼图素材(只算一遍)。"""
     head = [res.name, {True: "front", False: "back", None: ""}[truth], res.verdict, res.reason,
@@ -473,7 +486,7 @@ def analyse_image(gray: np.ndarray, res, truth: Optional[bool], verify: bool
         anas: List[dict] = []
         for rec in hole.corner_hits:
             check_corner_keys(rec)
-            ana = classify_corner(gray, hole, rec, verify)
+            ana = classify_corner(gray, clahe_only, hole, rec, verify)
             anas.append(ana)
             sw = ana["sweep"]
             rows.append(head + hmid + [
@@ -819,7 +832,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     T.setup_console()
     args = build_parser().parse_args(argv)
     T.HOLE_CHECK_COUNT = args.holes                            # 模块内是运行时读全局, 外部赋值即生效
-    T.PRINT_DEBUG = bool(args.show)
+    # 主模块把 corner_hits 里 circ/r/mark_* 这些字段的填充挂在 PRINT_DEBUG(-> IS_DEBUG_DETAIL)上;
+    # 本工具画框/写 CSV 必须拿到它们, 所以强制打开(与是否 --print 无关)。
+    # inspect() 本身不打印(逐帧表格在 inspector.main() 里, 这里不会触发), 打开它不会刷屏。
+    T.PRINT_DEBUG = True
 
     img_dir = args.dir or default_image_dir()
     if not os.path.isdir(img_dir):
@@ -865,10 +881,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("[WARN] 帧无效: %s" % name)
                 continue
             res, proc = T.inspect(bgr, name)
-            gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY) if proc.ndim == 3 else proc.copy()
+            if args.show:                                       # --print: 显式打印主模块逐帧明细
+                T.print_result(res)
+            # 再跑一遍 preprocess 拿主模块用的同一张 gray 与 clahe_only(确定性、无副作用);
+            # inspect 只返回 (res, bgr), 而特征B 的增强圆度用的是 clahe_only, 必须自己取。
+            _, gray, _, clahe_only, _ = T.preprocess(bgr)
             truth = forced if forced is not None else T.guess_label(name)
             try:
-                rows, per_hole = analyse_image(gray, res, truth, not args.no_verify)
+                rows, per_hole = analyse_image(gray, clahe_only, res, truth, not args.no_verify)
             except VerifyError as exc:
                 print("[FATAL] 保真核对失败 %s: %s" % (name, exc))
                 print("        本工具复刻的多阈值分割已与主模块实现分叉, 请同步 sweep_circularity()")
