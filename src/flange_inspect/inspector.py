@@ -68,7 +68,12 @@ CAM_FRAME_TIMEOUT_S = 2.0  # 已收到 seq=0 后，整帧必须在该时间内�
 CAM_QUEUE_SIZE = 8  # 完整帧缓冲深度：吸收连续 NG 时 UNO 串口等待造成的短时积压；配合出队过期预筛，正常填不满
 CAM_SOCKET_RCVBUF = 8 * 1024 * 1024  # 仅吸收 TCP 抖动；不能作为工件安全积压队列
 CAM_RECORD_MAX_PAYLOAD = 16 * 1024  # 实测图像块约 1.3 KB；异常大长度用于流重同步
-CAM_VALIDATE_RECORD_CHECKSUM = True
+CAM_VALIDATE_RECORD_CHECKSUM = False  # B 方案(2026-09-20 关, 可回退)：一帧要校验约 790 条记录,
+#   纯 Python sum() 是接收侧 CPU 大头。TCP 自带 16 位校验和覆盖线路损坏, 本地有线相机极少坏包,
+#   故关掉给 RX 线程减负。代价: 极少数 TCP 漏网的坏包可能进帧 → 坏像素。回退(要严格校验): 设 True。
+CAM_TCP_NODELAY = True  # B 方案(可回退)：关 Nagle, 主要影响我方 ACK 及时性, 近乎零成本。回退: 设 False。
+CAM_RX_PROBE = True  # A 方案(可回退)：RX 探针。统计 recv 最大间隔(GIL 被 inspect 饿死的直接证据),
+#   在 [SUMMARY] 打 rx_gap_max_ms / rx_recv_calls。定位"接收慢"是 CPU 还是 GIL 用, 稳定后可设 False。
 RESULT_DEADLINE_MS = 250.0  # 超时预算：图像入队 → 算法判定（含排队+BGR+inspect，不含网络取图/存图 IO）；须按现场速度/喷嘴距离实测修订
 TIMEOUT_ESCALATE_N = 15  # 连续超时达到该次数升级停线；0=永不自动停(纯 fail-safe)
 TIMING_RECENT_WINDOW = 200  # p95 只统计最近这些帧，避免长期运行内存增长
@@ -684,6 +689,11 @@ class Wtx10001Source:
         self.record_errors = 0
         self.reconnects = 0
         self.max_queue_depth = 0
+        # A 方案 RX 探针：recv 之间的最大间隔(ms) = RX 线程被饿死(拿不到 GIL 去收包)的直接证据；
+        # rx_recv_calls 为 recv 调用次数, 供算平均。间隔大 + 残帧多 = inspect 慢帧占 GIL 饿死 RX。
+        self.rx_gap_max_ms = 0.0
+        self.rx_recv_calls = 0
+        self._rx_last_recv_at: Optional[float] = None
         self.current_frame_timing: Optional[FrameTiming] = None
         self.current_frame_started_at: Optional[float] = None
         self.current_frame_enqueued_at: Optional[float] = None  # 超时窗口起点(perf_counter)
@@ -734,6 +744,8 @@ class Wtx10001Source:
         """只建立 socket；线程生命周期由 __init__/close 统一管理。"""
         sock = socket.socket()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, CAM_SOCKET_RCVBUF)
+        if CAM_TCP_NODELAY:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(CAM_CONNECT_TIMEOUT_S)
         sock.connect(self.addr)
         sock.settimeout(0.5)
@@ -1005,6 +1017,16 @@ class Wtx10001Source:
                 continue
             if not chunk:
                 raise OSError("相机关闭了连接")
+            if CAM_RX_PROBE:
+                # 记录本次 recv 拿到数据的时刻与上次的间隔：间隔越大, RX 线程被饿得越久。
+                # 超时(空转)不计入, 只量真正收到字节之间的空档。
+                now_rx = time.perf_counter()
+                if self._rx_last_recv_at is not None:
+                    gap_ms = (now_rx - self._rx_last_recv_at) * 1000.0
+                    if gap_ms > self.rx_gap_max_ms:
+                        self.rx_gap_max_ms = gap_ms
+                self._rx_last_recv_at = now_rx
+                self.rx_recv_calls += 1
             self._buf.extend(chunk)
         return []
 
@@ -2642,6 +2664,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if raw_dropped or raw_fail:
             RUNTIME_LOGGER.error("[SUMMARY] ⚠ RAW 有丢弃(%d)或写盘失败(%d)，与传感器张数将不一致，"
                                  "请查磁盘/降触发频率", raw_dropped, raw_fail)
+        # A 方案 RX 探针对账：rx_gap_max 大(比如 >100ms) 且 protocol_drops(残帧) 多 =
+        # RX 线程被 inspect 慢帧占 GIL 饿死、来不及收包 → TCP 反压 → 残帧。此时该上 C 方案(缩图/搬 C++)。
+        rx_gap_max = getattr(source, "rx_gap_max_ms", 0.0)
+        rx_calls = getattr(source, "rx_recv_calls", 0)
+        RUNTIME_LOGGER.info(
+            "[SUMMARY-RX] rx_gap_max=%.1fms rx_recv_calls=%d checksum=%s nodelay=%s；"
+            "gap 大且残帧多 → RX 被 inspect 饿死(GIL)，考虑缩图/搬 C++",
+            rx_gap_max, rx_calls, CAM_VALIDATE_RECORD_CHECKSUM, CAM_TCP_NODELAY)
         if n_no_actuator:
             RUNTIME_LOGGER.error("[SUMMARY] ⚠ %d 个 NG 无 UNO 可吹气(启动未连上)，实际未分选",
                                  n_no_actuator)
