@@ -1,4 +1,26 @@
 # -*- coding: utf-8 -*-
+"""推力保持架翻边止口在线视觉检测(纯 Python 生产版)。
+
+对接一台 AKUSENSE(明治传感) VDS10-BQ0106-WP 智能传感相机(VDS10 系列, IP67 防水,
+DC24V 0.2A 供电; 自报 Model VN2000, 私有协议 TCP 10001 端口)、
+一块 Arduino UNO(经它对接 PLC: 电脑无法直接输出 0V 信号, 由 UNO 与 PLC 对接,
+PLC 再驱动电磁阀对 NG 件喷气吹落)、一台振动盘上料机: 相机每触发一次拍一张翻边件正/反面图,
+本程序判 OK/NG, NG 就经 UNO->PLC->电磁阀吹气把工件从料道吹掉, 结果经 Modbus 回报 PLC。
+
+检测流水线(单件一帧):
+    preprocess            预处理: 灰度 + 中值 + CLAHE + 高斯, 出 work / clahe_only 两版
+    detect_hole_candidates  HoughCircles 粗找一圈螺栓孔
+    locate_part           三级定位工件中心与节圆(pitch_fit / 外圆 Hough / 掩膜质心兜底)
+    refine_hole           逐孔径向 50% 灰度跨越精定位孔心 + 圆拟合
+    feature_a_*           特征A: 孔 ROI 内翻边外圈(环状轮廓计数 / 同心 Hough)
+    feature_b_corner_marks 特征B: 孔周 4 个拐角的冲压小圆压痕(Hough + 圆度)
+    inspect               汇总判定: 单孔 A AND B, 孔间按 PART_LOGIC 组合
+
+判定安全规则(P0, 见 memory/cpp-vs-purepy-root-causes): 宁可误判 NG, 绝不可漏判 NG——
+真实 NG 被判 OK(逃逸)是最严重缺陷。工件不在位(残件/底板)必须判 NG, 见 REJECT_MASK_CENTROID。
+
+现场只需改"参数区"常量; 带"(可回退)"标注的开关默认值即当前产线行为, 改回注释里写的值即恢复。
+"""
 from __future__ import annotations
 
 import argparse
@@ -22,6 +44,13 @@ import numpy as np
 
 # ===== 新增这里！全局设置OpenCV线程数，直接运行/被import导入都生效 =====
 cv2.setNumThreads(4)
+
+# 项目根目录 = 本文件(src/flange_inspect/inspector_pure.py)向上两级。所有默认输出路径都锚定到它,
+# 不再写死 D:\ 之类的绝对盘符——别人克隆到任意盘/任意目录都能直接跑, 无需先造 D 盘。
+# 数据默认落到 <项目根>/data/ 下的子目录(NG/OK/RAW/logs), 首次写入时自动创建(见 imwrite_unicode
+# 与 setup_runtime_logging 里的 os.makedirs)。要改到别处: 命令行 --save-dir, 或直接改下面的 *_SAVE_DIR。
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_DATA_DIR = os.path.join(PROJECT_ROOT, "data")  # 默认数据根; 结果图/RAW/日志都在其下
 # =====================================================================================
 # ============================  参 数 区 (现场只改这里)  ================================
 # =====================================================================================
@@ -29,18 +58,19 @@ cv2.setNumThreads(4)
 # ---------- 1. 取图 / 运行模式 ----------
 # "local" =本地文件夹遍历(离线调试)
 # "camera"=厂家 10001 端口私有协议真直连(推荐: 相机直接推实时帧, 不落盘, 请求-应答天然握手)
-# "watch" =监视存图目录(依赖 MJ_Aisensor 存图, 见下)
+# "watch" =监视存图目录(依赖 MJ_Ai sensor 存图, 见下)
 # "http"  =相机 HTTP 接口(本机这台没有 Web 服务, 走不通; 保留给别的机型)
 SOURCE_MODE = "local"
-LOCAL_IMAGE_DIR = r"D:\新建文件夹\WTX3000-360C (DA7486717)"   # 样本目录(正/反面混放)
+LOCAL_IMAGE_DIR = os.path.join(PROJECT_ROOT, "sample_images")  # 默认样本目录
+#   锚定项目根下的 sample_images; 换目录用命令行 --dir 覆盖, 无需改这里
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 LOCAL_RECURSIVE = True  # 递归遍历子目录
 CAMERA_IP = "169.254.44.201"  # 相机 IP(实测直连: 本机 169.254.44.200/16, 无网关)
 
 # 真直连模式 "camera": 走厂家 10001 端口私有协议, 相机把无压缩 8 位灰度帧直接推过来, 不落盘。
 # 2026-09-05 实测走通: 一帧 1280x800 = 1024000 字节, 分 788 个记录块传输; 记录格式与命令表
-# 见 Wtx10001Source 的 docstring 与 docs/camera_config.md 1.8。
-CAMERA_PORT = 10001  # 厂家控制/数据通道(MJ_Aisensor 连的就是这个口)
+# 见 Vn2000Source 的 docstring 与 docs/camera_config.md 1.8。
+CAMERA_PORT = 10001  # 厂家控制/数据通道(MJ_Ai sensor 连的就是这个口)
 # 触发方式(上线用 "external"):
 #   "external"               = IO 外部硬触发: 上位机不发任何触发命令, 只保活 + 被动等相机推帧。
 #                              一个 IO 触发沿 = 拍一张 = 推一帧, 曝光时刻由工装/PLC 决定；
@@ -96,25 +126,26 @@ WATCH_POLL_S = 0.10  # 轮询间隔(s)
 WATCH_SETTLE_S = 0.15  # 大小连续两次不变才算写完, 防读到只写了一半的图
 WATCH_SKIP_EXISTING = True  # True=启动时的存量图片算已处理, 只等新图; False=先跑存量
 WATCH_IDLE_TIMEOUT_S = 0.0  # 无新图超过该秒数就退出; 0=一直等(上线用)
-WATCH_MAX_FRAMES = 0  # 0 = 无限
+WATCH_MAX_FRAMES = 0  # 监视模式最多处理多少张后自动退出; 0 = 不限张数, 一直监视下去(上线用),
+#   >0 仅用于调试(处理够 N 张就停)
 
 # ---------- 2. 预处理 ----------
 RESIZE_MAX_SIDE = 0  # >0 按最长边缩放提速; 0=原图。所有阈值均为比例量,缩放不影响判定
 MEDIAN_BLUR_K = 3  # 中值滤波核(奇数,0=关)。压制铁屑/椒盐噪点
 GAUSS_BLUR_K = 5  # 高斯核(奇数,0=关)
 CLAHE_CLIP = 2.0  # 限制对比度自适应直方图均衡, 抗油污/光照不均
-CLAHE_GRID = (8, 8)
+CLAHE_GRID = (8, 8)  # CLAHE 分块网格(列, 行): 图像切成 8x8 块各自均衡; 块越多局部对比越强但越易放大噪点
 
 # ---------- 3. 圆孔粗定位 (HoughCircles) ----------
 HOLE_R_MIN_RATIO = 0.030  # 圆孔半径下限 / 图像宽度  (实测样图 ≈0.042)
 HOLE_R_MAX_RATIO = 0.065  # 圆孔半径上限 / 图像宽度
 HOLE_MIN_DIST_RATIO = 0.060  # 相邻孔心最小间距 / 图像宽度
-HOLE_HOUGH_DP = 1.0
+HOLE_HOUGH_DP = 1.0  # HoughCircles 累加器分辨率与原图之比(1.0=同分辨率); 越大越快越糙
 HOLE_HOUGH_P1 = 120  # Canny 高阈值
 HOLE_HOUGH_P2 = 55  # 累加器阈值: 调小=多找孔(易误检), 调大=少找孔(易漏)
 HOLE_HOUGH_P2_FALLBACK = 32  # 第一遍找到的孔不足时自动降阈值重找一次(0=关闭)
 MIN_HOLE_COUNT = 4  # 有效圆孔少于该数 -> 直接 NG (异常保护)。2026-09-20 由 2 提到 4：
-#   977 张样本实测，全部真实 OK 件孔数 >=4(最小恰为 4)，唯一一张 NG 误判 OK(#128)只有 3 孔；
+#   975 张样本实测，全部真实 OK 件孔数 >=4(最小恰为 4)，唯一一张 NG 误判 OK(#128)只有 3 孔；
 #   提到 4 对真实 OK 召回零损失，同时干掉该 NG 逃逸。回退：改回 2。
 MAX_HOLE_CANDIDATES = 40  # Hough 候选上限, 防异常图卡死
 REJECT_MASK_CENTROID = True  # 工件在位守门：定位落到 mask_centroid 兜底(节圆拟不出且外圆找不到)时
@@ -123,12 +154,12 @@ REJECT_MASK_CENTROID = True  # 工件在位守门：定位落到 mask_centroid �
 
 # ---------- 4. 工件定位: 节圆(孔心圆)拟合 ----------
 PITCH_FIT_MIN_HOLES = 3  # 少于该数无法拟合节圆 -> 走兜底定位
-PITCH_FIT_ITERS = 6
+PITCH_FIT_ITERS = 6  # 节圆稳健拟合的重加权迭代次数(逐次剔离群孔); 越大越稳但越慢
 PITCH_FIT_TOL_RATIO = 0.06  # 内点容差 / 节圆半径
 PITCH_FIT_TOL_MIN_PX = 8.0  # 内点容差下限(px)
 OUTER_R_MIN_RATIO = 0.18  # 兜底: 外圆/中心大孔 Hough 半径范围 / 图像宽度
-OUTER_R_MAX_RATIO = 0.60
-OUTER_HOUGH_P2 = 90
+OUTER_R_MAX_RATIO = 0.60  # 兜底外圆半径上限 / 图像宽度(与上面的 MIN 一起框定搜索范围)
+OUTER_HOUGH_P2 = 90  # 兜底外圆 Hough 累加器阈值: 比孔用的更高, 只认证据充分的大圆, 防误检
 
 # ---------- 5. 孔心精定位 (径向 50% 灰度跨越 + 圆拟合) ----------
 REFINE_ANGLE_STEP_DEG = 2.0  # 射线角度步长(度)
@@ -139,7 +170,7 @@ REFINE_LAND_BAND = 1.45  # 台面灰度取样: r > 该值*粗半径
 REFINE_MIN_CONTRAST = 12  # 孔内/台面灰度差 < 该值 视为不是孔 -> 丢弃
 REFINE_EDGE_START = 0.45  # 跨越点搜索起始 / 粗半径
 REFINE_MIN_EDGE_PTS = 40  # 有效跨越点下限
-REFINE_ITERS = 4
+REFINE_ITERS = 4  # 孔心精定位圆拟合的重加权迭代次数(逐次剔离群跨越点)
 REFINE_INLIER_RATIO = 0.10  # 圆拟合内点容差 / 拟合半径
 USE_GLOBAL_HOLE_RADIUS = True  # True=用所有孔半径中位数做统一基准 r (同一工件孔径一致)
 HOLE_R_DEV_MAX = 0.25  # 单孔半径偏离中位数超过该比例 -> 该孔判为无效
@@ -160,8 +191,8 @@ RING_CLUSTER_GAP = 0.08  # 环半径聚类间隔 / r (小于该间隔视为同�
 RING_CLUSTER_MIN_HITS = 2  # 一个半径簇至少被 N 个阈值命中才算真环
 RING_COUNT_MIN = 2  # 环数 >= 该值 判定"存在翻边外圈"(正面)
 FLANGE_HOUGH_BAND = (1.12, 1.36)  # 同心 Hough 找翻边圆的半径范围 / r
-FLANGE_HOUGH_P1 = 110
-FLANGE_HOUGH_P2 = 20
+FLANGE_HOUGH_P1 = 110  # 翻边圆 Hough 的 Canny 高阈值
+FLANGE_HOUGH_P2 = 20  # 翻边圆 Hough 累加器阈值: 调小=易检出(易误), 调大=易漏
 FLANGE_CENTER_GATE = 0.14  # 翻边圆圆心允许偏离孔心 / r
 
 # ---------- 7. 特征B: 4 个拐角小圆压痕 ----------
@@ -170,9 +201,9 @@ FLANGE_CENTER_GATE = 0.14  # 翻边圆圆心允许偏离孔心 / r
 CORNER_SPEC = ((-131.0, 1.58), (-59.5, 1.79), (60.0, 1.79), (131.0, 1.58))
 CORNER_WIN_RATIO = 0.75  # 拐角微小 ROI 半宽 / r
 MARK_R_RATIO_RANGE = (0.28, 0.55)  # 压痕半径 / r 允许范围 (实测中位数 ≈0.38)
-MARK_HOUGH_P1 = 110
-MARK_MAX_CANDIDATES = 6
-MARK_DEDUP_DIST_RATIO = 0.18
+MARK_HOUGH_P1 = 110  # 拐角压痕 Hough 的 Canny 高阈值
+MARK_MAX_CANDIDATES = 6  # 单个拐角 ROI 内最多保留几个压痕候选圆(防杂散圆拖慢逐个打分)
+MARK_DEDUP_DIST_RATIO = 0.18  # 压痕候选去重的圆心间距阈值 / r (更近的视为同一个)
 MARK_HOUGH_P2 = 14  # 压痕 Hough 累加器阈值: 形状级预筛, 非圆毛刺无响应
 MARK_CENTER_GATE = 0.22  # 压痕圆心允许偏离拐角 ROI 中心 / r (实测定位重复性 σ≈0.08)
 MARK_MASK_RATIO = 1.25  # 圆度计算时的圆形裁剪掩膜半径 / 压痕半径
@@ -198,39 +229,40 @@ SAVE_OK_IMAGE = False  # OK 样本也保存(追溯用)
 SAVE_OVERLAY = True  # 保存时叠加检测结果(孔/ROI/拐角/环) 便于现场看图排查
 # ⚠ 采样标阈值时必须关掉(命令行 --no-overlay / --collect):
 #   dbg_report 会去分析图上的线条, 存叠加图等于喂错数据
-NG_SAVE_DIR = r"D:\zq\result\NG"  # 命令行 --save-dir / --collect DIR 可整体改到别处
-OK_SAVE_DIR = r"D:\zq\result\OK"  # (在 DIR 下自动建 OK/ 与 NG/ 两个子目录)
-JPEG_QUALITY = 92
+NG_SAVE_DIR = os.path.join(DEFAULT_DATA_DIR, "NG")  # NG 结果图默认目录(项目根/data/NG)；
+OK_SAVE_DIR = os.path.join(DEFAULT_DATA_DIR, "OK")  # OK 结果图默认目录。命令行 --save-dir / --collect DIR
+#   可整体改到别处(在该 DIR 下自动建 OK/ 与 NG/ 两个子目录)；目录首次写图时自动创建。
+JPEG_QUALITY = 92  # JPEG 存图质量(1~100)；SAVE_IMAGE_EXT=".jpg" 时生效，越高越清晰但占空间越大
 SAVE_IMAGE_EXT = ".jpg"  # 存图格式: ".jpg"=省空间(走 JPEG_QUALITY) /
 #   ".png"=无损(采样标阈值用, 免得把压缩自变量又加回来)
 # 命令行 --save-ext / --collect 可覆盖
 RAW_SAVE_EXT = ".png"  # RAW 恒定无损 PNG，与 SAVE_IMAGE_EXT 解耦。RAW 是追溯证据，必须能逐像素
 #   复现产线判定：JPEG 有损压缩在圆度卡阈值(0.75)的临界帧上足以让判定翻面，无法复盘。
 SAVE_RAW_IMAGE = True  # 完整帧无叠加留证；在采集线程内“帧一组装好就存”，与传感器存图一一对齐
-RAW_SAVE_DIR = r"D:\zq\result\RAW"
+RAW_SAVE_DIR = os.path.join(DEFAULT_DATA_DIR, "RAW")  # RAW 留证默认目录(项目根/data/RAW)；--save-dir 下建 RAW/
 SAVE_QUEUE_SIZE = 64  # 结果图后台存图队列深度；满了丢最旧留档图并计数，绝不阻塞检测线程
 SAVE_JOIN_TIMEOUT_S = 3.0  # 停机时等后台存图线程排空并退出的上限
 RAW_SAVE_ON_ASSEMBLY = True  # RAW 落盘点提前到帧组装(采集线程)：协议丢帧/队列过载/判定超时都不会吃掉 RAW
 RAW_SAVE_QUEUE_SIZE = 512  # RAW 专用大队列(与结果图分开)：RAW 必须与传感器张数对齐，尽量不丢；正常永远填不满
-RUNTIME_LOG_DIR = r"D:\zq\result\logs"
-RUNTIME_LOG_MAX_BYTES = 10 * 1024 * 1024
-RUNTIME_LOG_BACKUP_COUNT = 5
+RUNTIME_LOG_DIR = os.path.join(DEFAULT_DATA_DIR, "logs")  # 运行日志默认目录(项目根/data/logs)；启动时自动创建
+RUNTIME_LOG_MAX_BYTES = 10 * 1024 * 1024  # 单个日志文件上限(10 MiB)，超过滚动切分
+RUNTIME_LOG_BACKUP_COUNT = 5  # 滚动保留的历史日志份数(共 5 份，加当前=最多 6 个文件)
 
 # ---------- 10. Modbus-TCP 对接 PLC (占位, 默认关闭) ----------
-ENABLE_MODBUS = False
-PLC_IP = "192.168.1.10"
-PLC_PORT = 502
-PLC_UNIT_ID = 1
+ENABLE_MODBUS = False  # Modbus-TCP 回报 PLC 总开关: 当前占位默认关(现场靠 UNO 直连 PLC, 见下)
+PLC_IP = "192.168.1.10"  # PLC 的 Modbus-TCP 地址; 仅 ENABLE_MODBUS=True 时用
+PLC_PORT = 502  # Modbus-TCP 标准端口
+PLC_UNIT_ID = 1  # Modbus 从站(单元)ID
 PLC_COIL_OK = 0  # OK 线圈地址
 PLC_COIL_NG = 1  # NG 线圈地址
 PLC_REG_RESULT = 100  # 结果寄存器: 0=未检 1=OK 2=NG
 PLC_REG_HEARTBEAT = 101  # 心跳寄存器
 
 # ---------- 11. Arduino UNO PLC对接 ----------
-ENABLE_UNO = True
-UNO_PORT = "COM7"
+ENABLE_UNO = True  # UNO 执行器总开关: 电脑无法直接输出 0V 信号, 由 UNO 对接 PLC, PLC 再驱动电磁阀吹 NG 件
+UNO_PORT = "COM7"  # Arduino UNO 的串口号(Windows 设备管理器里看); 换机器多半要改这里
 UNO_PIN = 8  # Arduino UNO 输出引脚，当前接 PLC X12
-UNO_BAUDRATE = 9600  # 必须与测试2.py/Arduino Serial.begin 一致
+UNO_BAUDRATE = 115200  # 必须与uno_relay.py.py/Arduino uno_plc_trigger.ino 一致
 UNO_PULSE_SECONDS = 0.05  # UNO 固定NG脉冲时间，仅用于日志
 
 # =====================================================================================
@@ -243,8 +275,10 @@ NG_NO_FEATURE = "NG_NO_FEATURE"  # 两个孔都没有有效翻边/压痕特征
 NG_INVALID_FRAME = "NG_INVALID_FRAME"  # 非相机源图像读取失败
 TIMEOUT_NG = "TIMEOUT_NG"  # 算法超时/队列积压/过载：fail-safe 强制 NG，与缺陷 NG 分开
 NG_DEADLINE_EXCEEDED = TIMEOUT_NG  # 旧名兼容别名；新代码统一用 TIMEOUT_NG
-OK_PASS = "OK"
+OK_PASS = "OK"  # 合格判定值; is_ok 仅当 verdict==OK_PASS
 
+# 全局运行日志器。被 import 时默认挂 NullHandler(不输出、不报 "No handler" 警告);
+# 真正作为主程序跑时由 setup_runtime_logging() 换上控制台 + 滚动文件 handler。
 RUNTIME_LOGGER = logging.getLogger("thrust_cage_inspect")
 RUNTIME_LOGGER.addHandler(logging.NullHandler())
 
@@ -261,7 +295,7 @@ def setup_runtime_logging() -> None:
     RUNTIME_LOGGER.addHandler(console)
     try:
         os.makedirs(RUNTIME_LOG_DIR, exist_ok=True)
-        path = os.path.join(RUNTIME_LOG_DIR, "../../runtime.log")
+        path = os.path.join(RUNTIME_LOG_DIR, "runtime.log")  # 直接落在日志目录内
         handler = RotatingFileHandler(path, maxBytes=RUNTIME_LOG_MAX_BYTES,
                                       backupCount=RUNTIME_LOG_BACKUP_COUNT,
                                       encoding="utf-8")
@@ -408,6 +442,7 @@ class LocalFolderSource:
     """本地调试: 遍历文件夹里的样本图片。"""
 
     def __init__(self, folder: str, recursive: bool = True) -> None:
+        """扫描 folder 下所有受支持扩展名(IMAGE_EXTS)的图片, 按路径排序备用。"""
         self.folder = folder
         files: List[str] = []
         pattern = "**/*" if recursive else "*"
@@ -417,9 +452,11 @@ class LocalFolderSource:
         self.files = sorted(files)
 
     def __len__(self) -> int:
+        """样本图片总数。"""
         return len(self.files)
 
     def frames(self) -> Iterator[Tuple[str, Optional[np.ndarray]]]:
+        """逐张产出 (路径, 图像); 读失败的图像为 None, 交由主循环按无效帧处理。"""
         for path in self.files:
             yield path, imread_unicode(path)
 
@@ -432,6 +469,7 @@ class HttpCameraSource:
     """
 
     def __init__(self, ip: str, max_frames: int = 0, interval_s: float = 0.2) -> None:
+        """建 requests 会话取图。直连网段必须绕开系统代理, 否则相机 IP 会被丢给本地代理端口。"""
         self.url = CAMERA_URL_TEMPLATE.format(camera_ip=ip)
         self.max_frames = max_frames
         self.interval_s = interval_s
@@ -448,6 +486,7 @@ class HttpCameraSource:
             self._session.proxies = {"http": None, "https": None}
 
     def _grab(self) -> Optional[np.ndarray]:
+        """取一帧并解码为 BGR; 失败重试 HTTP_RETRY 次, 全失败返回 None。"""
         for attempt in range(max(1, HTTP_RETRY)):
             try:
                 resp = self._session.get(self.url, timeout=HTTP_TIMEOUT_S)
@@ -463,6 +502,7 @@ class HttpCameraSource:
         return None
 
     def frames(self) -> Iterator[Tuple[str, Optional[np.ndarray]]]:
+        """按 interval_s 间隔循环取图; max_frames<=0 时无限。"""
         n = 0
         while self.max_frames <= 0 or n < self.max_frames:
             n += 1
@@ -481,6 +521,7 @@ class WatchFolderSource:
     """
 
     def __init__(self, folder: str, recursive: bool = True, max_frames: int = 0) -> None:
+        """校验监视目录存在; 按 WATCH_SKIP_EXISTING 决定是否把存量图片记为已处理。"""
         if not os.path.isdir(folder):
             raise RuntimeError("监视目录不存在: %s" % folder)
         self.folder = folder
@@ -489,6 +530,7 @@ class WatchFolderSource:
         self.seen = set(self._scan()) if WATCH_SKIP_EXISTING else set()
 
     def _scan(self) -> List[str]:
+        """扫描监视目录当前所有受支持扩展名的图片路径。"""
         pattern = "**/*" if self.recursive else "*"
         out: List[str] = []
         for path in glob.glob(os.path.join(self.folder, pattern), recursive=self.recursive):
@@ -517,6 +559,7 @@ class WatchFolderSource:
             return False
 
     def frames(self) -> Iterator[Tuple[str, Optional[np.ndarray]]]:
+        """轮询监视目录, 按到达顺序(mtime)产出新落地且已写完的图片; 只读不删。"""
         n = 0
         t_idle = time.time()
         while self.max_frames <= 0 or n < self.max_frames:
@@ -575,6 +618,7 @@ class FrameTiming:
     queue_depth: Optional[int] = None
 
     def values(self) -> Dict[str, float]:
+        """抽出所有已填的 *_ms 耗时字段, 供 TimingStats 汇总。"""
         return {key: value for key, value in self.__dict__.items()
                 if key.endswith("_ms") and isinstance(value, (int, float))}
 
@@ -583,6 +627,7 @@ class TimingStats:
     """固定窗口的在线耗时统计，只有 --timing 时输出。"""
 
     def __init__(self, window: int = TIMING_RECENT_WINDOW) -> None:
+        """初始化统计容器: p95 只看最近 window 帧(滑窗), min/mean/max/count 累计全程。"""
         self.window = max(1, window)
         self.samples: Dict[str, Deque[float]] = {}
         self.metric_counts: Dict[str, int] = {}
@@ -592,6 +637,7 @@ class TimingStats:
         self.count = 0
 
     def add_values(self, values: Dict[str, float]) -> None:
+        """把一组 {指标名: 毫秒} 计入滑窗与累计统计。"""
         for key, value in values.items():
             value = float(value)
             self.samples.setdefault(key, deque(maxlen=self.window)).append(value)
@@ -601,6 +647,7 @@ class TimingStats:
             self.maxs[key] = max(self.maxs.get(key, value), value)
 
     def add(self, timing: FrameTiming, inspect_timings: Optional[Dict[str, float]] = None) -> None:
+        """累计一帧: 帧级 *_ms 指标 + 可选的算法内部阶段耗时(加 inspect. 前缀)。"""
         self.count += 1
         self.add_values(timing.values())
         if inspect_timings:
@@ -609,6 +656,7 @@ class TimingStats:
 
     @staticmethod
     def _percentile(values: List[float], pct: float) -> float:
+        """线性插值求百分位数(空序列返回 0)。"""
         if not values:
             return 0.0
         values = sorted(values)
@@ -618,6 +666,7 @@ class TimingStats:
         return values[low] + (values[high] - values[low]) * (pos - low)
 
     def summary_lines(self) -> List[str]:
+        """按指标名逐行汇总 count/min/mean/recent_p95/max, 供停机时打印。"""
         lines = ["[TIMING-SUMMARY] frames=%d window=%d" % (self.count, self.window)]
         for key in sorted(self.samples):
             recent = list(self.samples[key])
@@ -629,8 +678,9 @@ class TimingStats:
         return lines
 
 
-class Wtx10001Source:
-    """真直连取图: 厂家 10001 端口私有协议(相机自报 Model VN2000, WTX-3000-360C 是贴牌名)。
+class Vn2000Source:
+    """真直连取图: AKUSENSE(明治传感) VDS10-BQ0106-WP 相机的 10001 端口私有协议
+    (相机自报 Model VN2000)。
 
     2026-09-05 抓包 + 实测确认, 链路上每条记录都是同一个结构:
 
@@ -663,6 +713,10 @@ class Wtx10001Source:
     TRAILER = 2
 
     def __init__(self, ip: str, port: int = CAMERA_PORT, max_frames: int = 0) -> None:
+        """建链 + 起心跳线程; external 模式再起独立 RX 收帧线程。
+
+        RAW 存图器必须先于 RX 线程建好, 保证第一帧就能落盘, 与传感器张数对齐。
+        """
         self.addr = (ip, port)
         self.max_frames = max_frames
         self._sock: Optional[socket.socket] = None
@@ -705,16 +759,17 @@ class Wtx10001Source:
         self._open_socket()
         self._reconnect_needed.clear()
         self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat, name="wtx-heartbeat", daemon=True)
+            target=self._heartbeat, name="vn2000-heartbeat", daemon=True)
         self._heartbeat_thread.start()
         if self._is_external():
             self._rx_thread = threading.Thread(
-                target=self._receive_loop, name="wtx-receiver", daemon=True)
+                target=self._receive_loop, name="vn2000-receiver", daemon=True)
             self._rx_thread.start()
 
     # ---------- 帧封装 ----------
     @classmethod
     def _pack(cls, payload: bytes) -> bytes:
+        """把载荷封成一条控制帧(魔数 + 50 字节头 + 载荷 + 校验和尾)。"""
         head = bytearray(cls.HDR)
         head[0:4] = cls.MAGIC
         struct.pack_into("<H", head, 7, len(payload))  # 载荷长度
@@ -724,6 +779,7 @@ class Wtx10001Source:
 
     @classmethod
     def _order(cls, name: str, **extra: object) -> bytes:
+        """把一条命令(Order + 可选字段)封成 JSON 控制帧字节。"""
         obj: Dict[str, object] = {"CommuniInfo": {"PortCode": "Smsocket3"}, "Order": name}
         obj.update(extra)
         return cls._pack(json.dumps(obj, separators=(",", ":")).encode())
@@ -735,6 +791,7 @@ class Wtx10001Source:
 
     @classmethod
     def _trigger_frame(cls) -> bytes:
+        """按 CAM_TRIGGER_ORDER 生成软触发命令帧(仅软触发模式使用)。"""
         if CAM_TRIGGER_ORDER == "ContinuousImageCapture":
             return cls._order(CAM_TRIGGER_ORDER, ContinuousImageCapture="ImageCapture")
         return cls._order(CAM_TRIGGER_ORDER)
@@ -763,12 +820,14 @@ class Wtx10001Source:
             self._drain()
 
     def _detach_socket(self) -> Optional[socket.socket]:
+        """加锁把当前 socket 摘下并置空, 返回它交给调用方关闭(避免多线程重复关)。"""
         with self._socket_lock:
             sock, self._sock = self._sock, None
         return sock
 
     @staticmethod
     def _close_socket(sock: Optional[socket.socket]) -> None:
+        """安静关闭 socket(shutdown + close), 忽略已断开等异常。"""
         if sock is None:
             return
         try:
@@ -781,6 +840,7 @@ class Wtx10001Source:
             pass
 
     def _reopen_socket(self) -> bool:
+        """断链后重连, 最多试 CAM_RECONNECT_TRY 次; 停机中或全失败返回 False。"""
         self._close_socket(self._detach_socket())
         self._reset_parser()
         for attempt in range(1, max(1, CAM_RECONNECT_TRY) + 1):
@@ -798,6 +858,7 @@ class Wtx10001Source:
         return False
 
     def _send(self, data: bytes) -> None:
+        """加锁整块发送, 保证心跳线程与触发命令不交错写同一 socket。"""
         with self._send_lock:
             with self._socket_lock:
                 sock = self._sock
@@ -818,6 +879,8 @@ class Wtx10001Source:
                 self._close_socket(self._detach_socket())
 
     def close(self) -> None:
+        """停机: 软触发模式先发 StopRun, 置停止位, 关 socket 并 join 后台线程,
+        最后再关 RAW 存图器(把已入队 RAW 尽量写完, 与传感器张数对齐)。"""
         if self._stop.is_set():
             return
         if not self._is_external():
@@ -838,6 +901,7 @@ class Wtx10001Source:
 
     # ---------- 收帧 ----------
     def _reset_frame(self) -> None:
+        """清空当前正在组装的帧状态(像素/元数据/期望序号/计时), 准备收下一帧。"""
         self._pix = bytearray()
         self._meta = {}
         self._expected_seq = 0
@@ -845,10 +909,13 @@ class Wtx10001Source:
         self._frame_chunks = 0
 
     def _reset_parser(self) -> None:
+        """连接级复位: 丢弃未切完的残留字节缓冲并重置当前帧(重连/断链时用)。"""
         self._buf.clear()
         self._reset_frame()
 
     def _drop_frame(self, reason: str) -> None:
+        """丢弃当前正在组装的残帧并记因。残帧(传一半)也存档并标 PARTIAL,
+        以保证 RAW 张数与传感器对齐、可追溯断在哪一帧。仅在已开帧(有 seq)时计数。"""
         if self._expected_seq:
             self.protocol_drops += 1
             RUNTIME_LOGGER.error(
@@ -986,6 +1053,7 @@ class Wtx10001Source:
         return frame
 
     def _check_frame_timeout(self) -> None:
+        """已开帧(收到 seq=0)后若超过 CAM_FRAME_TIMEOUT_S 仍未收完整帧, 判帧内超时丢弃。"""
         if (self._expected_seq and CAM_FRAME_TIMEOUT_S > 0
                 and time.perf_counter() - self._frame_started_at > CAM_FRAME_TIMEOUT_S):
             self._drop_frame("帧内超时 %.2fs" % CAM_FRAME_TIMEOUT_S)
@@ -1131,11 +1199,16 @@ class Wtx10001Source:
 
     @staticmethod
     def _frame_name(frame: CameraFrame) -> str:
+        """由帧号 + 相机自报 ImageName(净化为文件名安全字符)拼出帧名, 供存图/日志。"""
         stamp = str(frame.meta.get("ImageName") or "").strip()
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stamp)[:70]
         return "CAM_F%06d_%s" % (frame.frame_id, safe) if safe else "CAM_F%06d" % frame.frame_id
 
     def _dequeue_external(self) -> CameraFrame:
+        """external 模式主线程从 FIFO 取下一完整帧; 队空则阻塞等待, 定期打"仍在等触发"提示。
+
+        先把队里已通过完整性校验的帧消费完, 再看 _fatal(协议/重连类故障)决定是否抛错停线。
+        """
         # 过载已改为“丢最旧继续跑”，不再置 _fatal；_fatal 只来自协议/重连类故障，需停线。
         # 但已在队列里的帧要先消费完(它们已通过完整性校验)，再看 fatal 停线。
         t_hint = time.monotonic()
@@ -1156,6 +1229,8 @@ class Wtx10001Source:
         raise AcquisitionError("相机源已关闭")
 
     def frames(self) -> Iterator[Tuple[str, Optional[np.ndarray]]]:
+        """产出 (帧名, BGR): external 从 RX 队列取, 软触发同步取一帧;
+        顺带记录本帧各段计时(采集/排队/转换)与超时窗口起点, 供主循环判超时。"""
         n = 0
         while self.max_frames <= 0 or n < self.max_frames:
             if self._is_external():
@@ -1201,12 +1276,12 @@ class Wtx10001Source:
 def build_source(mode: str, folder: str, ip: str):
     """一键切换取图方式。"""
     if mode == "camera":
-        src = Wtx10001Source(ip, CAMERA_PORT, CAM_MAX_FRAMES)
+        src = Vn2000Source(ip, CAMERA_PORT, CAM_MAX_FRAMES)
         how = ("IO 外部硬触发(被动等相机推帧, 不发触发命令/StopRun)"
-               if Wtx10001Source._is_external() else "软触发 %s" % CAM_TRIGGER_ORDER)
+               if Vn2000Source._is_external() else "软触发 %s" % CAM_TRIGGER_ORDER)
         print("[INFO] 取图模式: CAMERA 直连 %s:%d  触发=%s  期望 %d x %d 灰度"
               % (ip, CAMERA_PORT, how, CAM_IMG_W, CAM_IMG_H))
-        if Wtx10001Source._is_external():
+        if Vn2000Source._is_external():
             print("[INFO] 已连上并保活, 等工件到位的 IO 触发信号...  "
                   "(相机侧「触发源」须为 IO 硬触发且方案在运行态; Ctrl-C 停机)")
         return src
@@ -1265,6 +1340,7 @@ class InspectResult:
 
     @property
     def is_ok(self) -> bool:
+        """是否合格: 仅当 verdict 恰为 OK_PASS。任何 NG/超时/异常判定都为 False。"""
         return self.verdict == OK_PASS
 
 
@@ -1576,17 +1652,38 @@ def feature_b_corner_marks(gray: np.ndarray, clahe_only: np.ndarray, hx: float, 
                            part_cx: float, part_cy: float,
                            corner_spec: Sequence[Tuple[float, float]] = CORNER_SPEC
                            ) -> Tuple[int, int, List[dict]]:
+    """特征B: 数单个螺栓孔周围 4 个拐角上的冲压小圆压痕(正面才有, 反面/漏冲没有)。
+
+    正面翻边件在每个孔的 4 个固定拐角位置有冲压小圆压痕; 反面或漏冲件这些位置是平的。
+    压痕够数(>= MIN_VALID_MARKS)即判本孔特征B通过。
+
+    定位方式对旋转免疫: 拐角位置不用绝对坐标, 而是以"孔心 -> 工件中心"为基准方向(ux,uy),
+    按 corner_spec 里的 (角度, 距离比) 旋转+缩放推算——工件在料道上随便转都能对上。
+
+    每个拐角: 开一个 ROI 小窗 -> HoughCircles 找候选圆 -> 按到窗心距离筛 -> 逐个算圆度打分取最优。
+
+    !!! 逃逸(NG->OK)风险的唯一来源就在下面 accepted 那行的宽松兜底 !!!
+    一个压痕被"接受"有两条路(见 accepted):
+      1) 硬路: 原图圆度 circ_raw > MARK_CIRCULARITY_MIN(0.75) —— 干净压痕走这条。
+      2) 宽松兜底: (position_ok and shape_ok) —— 圆度没过硬阈值, 但位置对、形状像, 也接受。
+    第 2 条是 #128/#444 这类"临界压痕"逃逸的机制(参考算法自带, 非本次引入)。
+    设 FEATURE_B_DISABLE_SOFT_ACCEPT=True 可去掉第 2 条(收紧), 但会拿真 OK 召回换,
+    977 张实测代价见 memory/false-ok-part-present-gate。
+
+    返回 (valid=接受的压痕数, in_frame=落在图内的拐角数, details=逐拐角调试记录)。
+    """
     global PRINT_DEBUG
     IS_DEBUG_DETAIL = PRINT_DEBUG
 
+    # 基准方向 = 从工件中心指向本孔心的单位向量; 拐角位置全部相对它旋转, 故与工件朝向无关。
     ux, uy = hx - part_cx, hy - part_cy
     norm = float(np.hypot(ux, uy))
-    if norm < 1e-6:
+    if norm < 1e-6:  # 孔心与工件中心重合(定位异常), 无法定方向, 直接放弃本孔
         return 0, 0, []
     ux, uy = ux / norm, uy / norm
 
-    half = int(round(CORNER_WIN_RATIO * r))
-    if half < 5:
+    half = int(round(CORNER_WIN_RATIO * r))  # 拐角 ROI 半窗边长, 按孔径缩放
+    if half < 5:  # 孔太小, ROI 不足以容下压痕, 放弃
         return 0, 0, []
     r_lo = max(3, int(round(MARK_R_RATIO_RANGE[0] * r)))
     r_hi = max(r_lo + 2, int(round(MARK_R_RATIO_RANGE[1] * r)))
@@ -1639,32 +1736,39 @@ def feature_b_corner_marks(gray: np.ndarray, clahe_only: np.ndarray, hx: float, 
         if all_cand.ndim != 2 or all_cand.shape[1] != 3:
             details.append(rec)
             continue
+        # 只保留圆心离窗中心够近的候选(压痕应在拐角标称位置附近), 滤掉 Hough 在窗边缘的杂散圆。
         cand = [c for c in all_cand
                 if np.hypot(c[0] - half, c[1] - half) <= MARK_CENTER_GATE * r]
 
+        # 标称门限内一个都没有时, 放宽到 0.32(动态门限): 精定位/节圆略有偏差时给一次补救,
+        # 但记 dynamic_roi=True, 后面 position_ok 也相应用 0.32, 不无脑放宽。
         dynamic_roi = False
         if not cand:
             dynamic_gate = 0.32
             cand = [c for c in all_cand
                     if np.hypot(c[0] - half, c[1] - half) <= dynamic_gate * r]
             dynamic_roi = bool(cand)
-        if not cand:
+        if not cand:  # 放宽后仍无候选, 本拐角无压痕
             details.append(rec)
             continue
 
+        # 逐候选打分, 取最优的一个代表本拐角。score 是元组, 按优先级排序:
+        # (是否被接受, 两版圆度之和, 越居中越好, 半径比越接近 0.38 越好)。
         best = None
-
         for bx, by, br in _dedup_mark_candidates(np.asarray(cand, dtype=np.float64),half,r,):
-            circ_raw = _best_mark_circularity(win,bx,by,br,)
-            circ_enhanced = _best_mark_circularity(win_enhanced,bx,by,br,)
+            circ_raw = _best_mark_circularity(win,bx,by,br,)              # 原图(仅平滑)圆度
+            circ_enhanced = _best_mark_circularity(win_enhanced,bx,by,br,)  # CLAHE 增强图圆度
             circ = max(circ_raw, circ_enhanced)
-            center_offset = float(np.hypot(bx - half,by - half,)/max(r, 1e-6))
-            radius_ratio = float(br / max(r, 1e-6))
+            center_offset = float(np.hypot(bx - half,by - half,)/max(r, 1e-6))  # 偏窗心程度(比孔径)
+            radius_ratio = float(br / max(r, 1e-6))                        # 压痕半径 / 孔径
             position_ok = center_offset <= (0.32 if dynamic_roi else MARK_CENTER_GATE)
+            # 形状像压痕: 半径比在合理带内 + 增强图较圆 + 原图不完全是噪声。
             shape_ok = (0.28 <= radius_ratio <= 0.55 and circ_enhanced > 0.45 and circ_raw > 0.10)
+            # ==== 接受判据(逃逸风险点, 详见函数 docstring) ====
             if FEATURE_B_DISABLE_SOFT_ACCEPT:
-                accepted = bool(circ_raw > MARK_CIRCULARITY_MIN)
+                accepted = bool(circ_raw > MARK_CIRCULARITY_MIN)  # 收紧: 只认硬圆度
             else:
+                # 现状: 硬圆度过, 或(位置对且形状像)兜底。后者是临界压痕逃逸的来源。
                 accepted = bool(circ_raw > MARK_CIRCULARITY_MIN or (position_ok and shape_ok))
             score = (accepted,circ_raw + circ_enhanced,-center_offset,-abs(radius_ratio - 0.38))
             if best is None or score > best[0]:
@@ -1725,12 +1829,14 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
     stage_start = t0
 
     def stage_done(key: str) -> None:
+        """记下上一阶段耗时(仅 timing 开启时)并重置计时起点。"""
         nonlocal stage_start
         if timing:
             res.timings_ms[key] = (time.perf_counter() - stage_start) * 1000.0
         stage_start = time.perf_counter()
 
     def finish() -> Tuple[InspectResult, np.ndarray]:
+        """统一收尾: 记总耗时后返回 (结果, 图像)。各提前返回分支共用, 保证耗时必被记。"""
         res.elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if timing:
             res.timings_ms["inspect_total"] = res.elapsed_ms
@@ -1965,10 +2071,11 @@ class RawFrameSaver:
       - 落盘点提前到帧组装(采集线程)，协议丢帧/队列过载/判定超时都不会吃掉 RAW；
       - 独立大队列(RAW_SAVE_QUEUE_SIZE)，与可牺牲的结果图分开，尽量不丢；
       - 传一半的残帧也存(补零到整帧 + 文件名标 PARTIAL_<字节数>b)，保证张数守恒、可追溯。
-    沿用 Wtx10001Source 的线程约定：daemon + Event 停机 + join 超时 + 跳过当前线程。
+    沿用 Vn2000Source 的线程约定：daemon + Event 停机 + join 超时 + 跳过当前线程。
     """
 
     def __init__(self) -> None:
+        """建 RAW 专用大队列并起后台写盘线程; 计数器供停机对账(与传感器张数比对)。"""
         self._q: "queue.Queue[tuple]" = queue.Queue(maxsize=max(1, RAW_SAVE_QUEUE_SIZE))
         self._stop = threading.Event()
         self.raw_saved = 0       # 完整帧 RAW 落盘数
@@ -2017,6 +2124,7 @@ class RawFrameSaver:
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     def _run(self) -> None:
+        """后台循环: 取出像素解成 BGR(残帧补零)并写无损 PNG; 异常只计数不带垮线程。"""
         while not self._stop.is_set() or not self._q.empty():
             try:
                 pixels, name, partial = self._q.get(timeout=0.3)
@@ -2027,7 +2135,7 @@ class RawFrameSaver:
                     bgr = self._pad_to_frame(pixels)
                     save_name = "%s_PARTIAL_%db" % (name, len(pixels))
                 else:
-                    bgr = Wtx10001Source._to_bgr(pixels)
+                    bgr = Vn2000Source._to_bgr(pixels)
                     save_name = name
                 if bgr is None:
                     self.raw_fail += 1
@@ -2049,6 +2157,7 @@ class RawFrameSaver:
                 RUNTIME_LOGGER.exception("[RAW-ERROR] 后台 RAW 存图异常 image=%s", name)
 
     def close(self) -> None:
+        """停机: 置停止位, 等后台线程把已入队 RAW 排空写完(超时仍有未写盘则告警)。"""
         if self._stop.is_set():
             return
         self._stop.set()  # 停机前把已入队 RAW 尽量写完(_run 会排空 queue)
@@ -2064,10 +2173,11 @@ class AsyncImageSaver:
 
     结果图(overlay)是可牺牲的追溯图，队列满时丢最旧并计数告警（判定/吹气早已完成）。
     RAW 不走这里——RAW 归采集线程的 RawFrameSaver，硬要求与传感器张数一致。
-    沿用 Wtx10001Source 的线程约定：daemon + Event 停机 + join 超时。
+    沿用 Vn2000Source 的线程约定：daemon + Event 停机 + join 超时。
     """
 
     def __init__(self) -> None:
+        """建结果图队列并起后台写盘线程(结果图可牺牲, 队满丢最旧不阻塞检测)。"""
         self._q: "queue.Queue[tuple]" = queue.Queue(maxsize=max(1, SAVE_QUEUE_SIZE))
         self._stop = threading.Event()
         self.dropped_saves = 0  # 结果图队列满被丢弃的任务数
@@ -2078,12 +2188,14 @@ class AsyncImageSaver:
         self._thread.start()
 
     def submit_result(self, bgr: np.ndarray, res: "InspectResult", overlay: bool) -> None:
+        """主循环非阻塞提交一张结果图(可选叠加)入后台队列。"""
         # RAW 不再走这里(归采集线程的 RawFrameSaver)，本类只管可牺牲的结果图。
         if bgr is None:
             return
         self._submit(("result", bgr, None, res, overlay))
 
     def _submit(self, task: tuple) -> None:
+        """入队一个存图任务; 队满则丢最旧并计数告警(判定/吹气早已完成, 只损失个别追溯图)。"""
         try:
             self._q.put_nowait(task)
         except queue.Full:
@@ -2104,6 +2216,7 @@ class AsyncImageSaver:
         self.max_queue_depth = max(self.max_queue_depth, depth)
 
     def _run(self) -> None:
+        """后台循环: 逐个取出存图任务写盘; 异常只记日志不带垮线程。"""
         while not self._stop.is_set() or not self._q.empty():
             try:
                 task = self._q.get(timeout=0.3)
@@ -2115,6 +2228,7 @@ class AsyncImageSaver:
                 RUNTIME_LOGGER.exception("[SAVE-ERROR] 后台存图异常")
 
     def _write(self, task: tuple) -> None:
+        """实际落盘一张结果图(按 SAVE_OK_IMAGE/SAVE_NG_IMAGE 过滤); 该存却失败时计数报错。"""
         _kind, bgr, _name, res, overlay = task
         should = (res.is_ok and SAVE_OK_IMAGE) or ((not res.is_ok) and SAVE_NG_IMAGE)
         path = save_result_image(bgr, res, overlay=overlay)
@@ -2125,6 +2239,7 @@ class AsyncImageSaver:
             RUNTIME_LOGGER.error("[RESULT-ERROR] image=%s 结果图保存失败", res.name)
 
     def close(self) -> None:
+        """停机: 置停止位, 等后台线程把已入队留档图排空写完(超时仍有未写盘则告警)。"""
         if self._stop.is_set():
             return
         self._stop.set()  # 停机前先把已入队留档尽量写完(_run 会排空 queue)
@@ -2166,6 +2281,7 @@ class ModbusReporter:
     """
 
     def __init__(self, enabled: bool = ENABLE_MODBUS) -> None:
+        """占位构造: 通信代码尚未接通, 启用时仅提示按注释解开。"""
         self.enabled = enabled
         self.client = None
         self.tick = 0
@@ -2173,12 +2289,15 @@ class ModbusReporter:
             print("[INFO] Modbus 占位已启用, 但通信代码尚未接通 —— 请按 ModbusReporter 注释解开")
 
     def connect(self) -> bool:
+        """占位: 未接通, 恒返回 False。"""
         return False
 
     def report(self, ok: bool) -> None:  # noqa: ARG002
+        """占位: 仅自增心跳计数, 不实际写 PLC。"""
         self.tick += 1
 
     def close(self) -> None:
+        """占位: 无连接可关。"""
         return None
 
 
@@ -2282,6 +2401,7 @@ def guess_label(name: str) -> Optional[bool]:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """解析命令行参数(取图模式/存图/标定/采样/耗时等); 默认值取自头部参数区常量。"""
     ap = argparse.ArgumentParser(description="推力保持架垫片 冲压翻边正/反面检测")
     ap.add_argument("--mode", choices=("local", "camera", "watch", "http"), default=SOURCE_MODE,
                     help="取图方式: local=遍历目录, camera=10001 私有协议真直连(产线推荐), "
@@ -2318,6 +2438,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def _fmt_ms(value: Optional[float]) -> str:
+    """毫秒值格式化: None 显示为 "-", 否则保留两位小数, 供日志对齐。"""
     return "-" if value is None else "%.2f" % value
 
 
@@ -2350,6 +2471,8 @@ def log_frame_timing(name: str, timing: FrameTiming, res: InspectResult) -> None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """程序主入口: 解析参数 -> 建取图源/UNO/PLC -> 逐帧检测判定 -> NG 立刻吹气/报 PLC ->
+    异步存图 + 记账。含出队过期预筛与连续超时升级停线等 fail-safe, 停机时打印汇总与对账。"""
     setup_console()
     setup_runtime_logging()
     args = parse_args(argv)
@@ -2463,6 +2586,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        queue_wait_ms, inspect_ms, window_ms, raw_verdict: str) -> None:
         """始终打印的 TIMEOUT_NG 醒目日志：记录四要素+根因，供事后区分算法慢/系统卡顿。"""
         def _wall(t):
+            """把墙钟时间戳格式化成 HH:MM:SS.mmm(None 显示 n/a)。"""
             if t is None:
                 return "n/a"
             return "%s.%03d" % (time.strftime("%H:%M:%S", time.localtime(t)),
