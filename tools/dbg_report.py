@@ -44,8 +44,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import thrust_cage_flange_inspect as T          # noqa: E402  主算法模块, 本文件只读不改
+# 加入仓库根(tools/ 的上一级)到 sys.path, 以便 import src.flange_inspect;
+# 注意要两层 dirname: __file__ 在 tools/ 下, 只加一层会指到 tools/ 找不到 src。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.flange_inspect import inspector as T
 
 # ---------------------------------------------------------------- 契约检查
 # 本工具刻意依赖主模块的内部实现(含带下划线的 _best_mark_circularity)。
@@ -66,7 +68,7 @@ def check_contract() -> None:
     missing = [n for n in REQ_FUNCS + REQ_CONSTS if not hasattr(T, n)]
     if missing:
         print("[FATAL] 主模块缺少本工具依赖的名字: %s" % ", ".join(missing))
-        print("        thrust_cage_flange_inspect.py 可能已重构, 请同步更新 dbg_report.py")
+        print("        inspector.py 可能已重构, 请同步更新 dbg_report.py")
         raise SystemExit(3)
     if len(T.CORNER_SPEC) != 4:
         print("[FATAL] CORNER_SPEC 长度 %d != 4, 拼图版式按 4 拐角写死" % len(T.CORNER_SPEC))
@@ -92,9 +94,15 @@ def default_image_dir() -> str:
     return os.environ.get("DBG_DIR") or IMAGE_DIR or T.LOCAL_IMAGE_DIR
 
 
+# 仓库根 = tools/ 的上一级(与 sys.path 的 bootstrap 一致)。
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def default_out_dir() -> str:
+    # 优先级: 环境变量 DBG_OUT > 本文件顶部 OUT_DIR > 仓库根/artifacts/dbg
+    # 不再回落到主模块 NG_SAVE_DIR 的父目录(那是 D:\zq\result, 与项目无关)。
     return (os.environ.get("DBG_OUT") or OUT_DIR
-            or os.path.dirname(T.NG_SAVE_DIR) or "result")
+            or os.path.join(_REPO_ROOT, "artifacts", "dbg"))
 
 
 # ---------------------------------------------------------------- 版式 / 配色
