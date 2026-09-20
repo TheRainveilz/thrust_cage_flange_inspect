@@ -47,7 +47,7 @@ import numpy as np
 # 加入仓库根(tools/ 的上一级)到 sys.path, 以便 import src.flange_inspect;
 # 注意要两层 dirname: __file__ 在 tools/ 下, 只加一层会指到 tools/ 找不到 src。
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.flange_inspect import inspector as T
+from src.flange_inspect import inspector_pure as T
 
 # ---------------------------------------------------------------- 契约检查
 # 本工具刻意依赖主模块的内部实现(含带下划线的 _best_mark_circularity)。
@@ -68,7 +68,7 @@ def check_contract() -> None:
     missing = [n for n in REQ_FUNCS + REQ_CONSTS if not hasattr(T, n)]
     if missing:
         print("[FATAL] 主模块缺少本工具依赖的名字: %s" % ", ".join(missing))
-        print("        inspector.py 可能已重构, 请同步更新 dbg_report.py")
+        print("        inspector_pure.py 可能已重构, 请同步更新 dbg_report.py")
         raise SystemExit(3)
     if len(T.CORNER_SPEC) != 4:
         print("[FATAL] CORNER_SPEC 长度 %d != 4, 拼图版式按 4 拐角写死" % len(T.CORNER_SPEC))
