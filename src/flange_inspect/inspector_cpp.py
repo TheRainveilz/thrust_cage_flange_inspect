@@ -1,44 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-金属推力保持架垫片 —— 冲压翻边正/反面检测 (OpenCV-Python 后台算法)
 
-实现思路
---------
-1) 取图层抽象：LocalFolderSource(本地遍历调试) / WatchFolderSource(监视存图目录) /
-   Wtx10001Source(厂家 10001 端口私有协议真直连, 相机直接推无压缩灰度帧) /
-   HttpCameraSource(开放了 HTTP 的机型)，由 SOURCE_MODE 一键切换，业务逻辑完全不变。
-2) 工件定位(不用固定 ROI)：HoughCircles 粗找所有圆孔 -> 用孔心做最小二乘圆拟合
-   (带迭代剔野点)得到"节圆"= 工件中心 + 节圆半径。工件任意旋转/偏移都自适应；
-   即使外圆被相机视场切掉也能定位(现场样图正是这种半幅视野)。
-   外圆/内孔 Hough 与工件掩膜质心作为二级/三级兜底。
-3) 孔心精定位：以粗圆心为起点，沿 360° 射线找"孔内-台面"灰度 50% 跨越点，
-   对跨越点做圆拟合(迭代剔野点)，得到亚像素级孔心与真实孔半径 r。
-   同一工件所有孔径一致，故取全部孔 r 的中位数作为统一基准，抗单孔失配。
-4) 特征A(翻边外圈)：孔 ROI 内多阈值(百分位序列)二值化 -> 轮廓计数，
-   只保留"与孔同心"的轮廓(平均半径在环带内 + 径向标准差小 + 角度覆盖率够),
-   再按平均半径聚类 -> 环数。正面=孔口环+翻边外环>=2，反面只有单圈冲裁轮廓=1。
-   并行用"同心 Hough"在 [1.12,1.36]r 找翻边圆作为 OR 兜底(现场光照不均时更稳)。
-5) 特征B(拐角小圆压痕)：4 个拐角相对"工件中心->孔心"径向方向固定角度分布
-   (实测 -131°/-59.5°/+60°/+131°，随工件旋转自动跟随)，在每个拐角开微小 ROI，
-   先用 HoughCircles 做形状级筛选(毛刺/铁屑/划痕非圆 -> 无响应),
-   再对命中圆做多阈值分割并计算 circularity = 4*pi*area/perimeter**2，>0.75 记为有效压痕。
-6) 判定：单孔 = 特征A AND 特征B；工件 = 孔1 OR 孔2 -> OK，全部无效 -> NG。
-7) 异常保护：找不到工件/圆孔不足 -> 直接 NG。NG 图自动落盘，可选叠加调试图。
-8) 预留 Modbus-TCP 对接 PLC 的注释占位(见文件末 ModbusReporter)。
-
-用法
-----
-    python inspector_cpp.py                 # 按头部常量运行
-    python inspector_cpp.py --dir  D:\\samples
-    python inspector_cpp.py --mode camera   # 真直连: 等 IO 外部触发, 来一件判一件
-    python inspector_cpp.py --mode camera --trigger MainRunOnce   # 台上调试用软触发
-    python inspector_cpp.py --mode http --ip 192.168.1.100
-    python inspector_cpp.py --debug         # 输出叠加调试图
-    python inspector_cpp.py --calib         # 拐角角度/尺寸标定(换型用)
-    python inspector_cpp.py --mode camera --collect "D:\\zq\\samples\\直连_正"
-                                                         # 采样: 原始帧(不划线) + PNG 无损 + OK 也存,
-                                                         #   一轮只放一类件, 之后交 dbg_report --truth
-"""
 from __future__ import annotations
 
 import argparse
@@ -55,6 +16,16 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+# bcorner(.pyd) 与其依赖的 opencv_world4140.dll / opencv_videoio_ffmpeg4140_64.dll
+# 现在都放在本包目录下。裸 import bcorner 依赖两件事, 这里显式补齐, 免得换 cwd 就崩:
+#   1) 包目录要在 sys.path 上, 否则 ModuleNotFoundError: No module named 'bcorner'
+#   2) 包目录要在 DLL 搜索路径上, 否则 .pyd 加载时找不到那两个 opencv DLL (ImportError)
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PKG_DIR not in sys.path:
+    sys.path.insert(0, _PKG_DIR)
+if hasattr(os, "add_dll_directory"):          # Windows / Python 3.8+
+    os.add_dll_directory(_PKG_DIR)
 import bcorner
 # ===== 新增这里！全局设置OpenCV线程数，直接运行/被import导入都生效 =====
 cv2.setNumThreads(4)
