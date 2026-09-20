@@ -46,7 +46,7 @@ def load_impl(impl: str):
     if impl == "cpp":
         from src.flange_inspect import inspector_cpp as T
     elif impl == "pure":
-        from src.flange_inspect import inspector as T
+        from src.flange_inspect import inspector_pure as T
     else:
         raise ValueError("--impl 只能是 pure 或 cpp: %r" % impl)
     return T
