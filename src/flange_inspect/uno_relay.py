@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """Arduino UNO 自动控制模块。
 
-与 PLC_OK_NG.ino 使用同一协议：
-    NG\n      D8 输出 HIGH，保持 500 ms，然后自动回 LOW
-    OK\n      确保 D8 为 LOW，不触发 PLC
+与 uno_plc_trigger.ino 使用同一协议（固件为非阻塞短脉冲版）：
+    NG\n      D8 输出一个短触发脉冲(固件 PULSE_MS，默认 50ms)后自动回 LOW；固件立刻回 "NG" ACK
+    OK\n      确保 D8 为 LOW，不触发 PLC；固件回 "OK"
     STATUS\n  查询 D8 状态
 
+电磁阀吹气的延迟/踢除时间由 PLC 自管，UNO 只负责给 PLC 一个干净的触发脉冲。
+固件对 NG/OK 立即 ACK，send() 收到即返回，不再空等 SERIAL_TIMEOUT。
 主程序只在最终判定 NG 时调用 pulse()；OK 不发送指令。
 """
 from __future__ import annotations
@@ -17,9 +19,9 @@ from typing import Optional
 import serial
 
 
-COM_PORT = "COM6"
+COM_PORT = "COM7"
 UNO_PIN = 8
-BAUD_RATE = 9600
+BAUD_RATE = 115200
 SERIAL_TIMEOUT = 0.20
 UNO_RESET_WAIT = 1.0
 NG_PULSE_SECONDS = 0.50
@@ -107,8 +109,8 @@ class UnoRelayController:
             return False
 
     def pulse(self) -> bool:
-        """发送一次 NG 指令，由 Arduino 负责保持 500ms 并自动关闭。"""
-        print(f"[UNO] NG -> D{self.pin} HIGH for {self.pulse_seconds:.3f}s")
+        """发送一次 NG 指令；由 Arduino 输出短触发脉冲(固件 PULSE_MS)并自动回 LOW。"""
+        print(f"[UNO] NG -> D{self.pin} 触发脉冲(脉宽由固件 PULSE_MS 控制)")
         return self.send("NG")
 
     def off(self) -> bool:
