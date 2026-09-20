@@ -1,0 +1,16 @@
+[project]
+name = "thrust-cage-flange-inspect"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.6",
+    # 与 C++ 扩展(bcorner)链接的 OpenCV 4.14.0 对齐, 消除 remap/轮廓等亚像素差异
+    "opencv-python==4.14.0.94",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+# Modbus TCP 输出到 PLC 时才需要(inspector 内延迟 import)
+plc = ["pymodbus>=3.0"]
+# HTTP 相机模式 / 回传时才需要(延迟 import, 本地调试无需)
+http = ["requests>=2.28"]
