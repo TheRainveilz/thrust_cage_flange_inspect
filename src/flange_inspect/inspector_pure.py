@@ -467,6 +467,37 @@ def fit_circle_ransac(pts: np.ndarray, iters: int, tol_ratio: float, tol_min: fl
     return cx, cy, r, k
 
 
+def fit_pitch_anchored(pts: np.ndarray, seed_cx: float, seed_cy: float, r_floor: float,
+                       tol_ratio: float, tol_min: float, min_pts: int, iters: int,
+                       max_combos: int) -> Optional[Tuple[float, float, float, int]]:
+    """外圆中心已知时的节圆拟合 —— 把 3 点 RANSAC 降成"半径投票 + 干净子集重拟合"。
+
+    孔阵与工件外圆同心, 所以外圆中心是节圆中心的可靠先验。有了中心, 节圆只剩 1 个自由度
+    (半径), 比在全量污染点上枚举 3 点稳得多(反面 47% 落到 boundary_circle 正是因为 3 点
+    RANSAC 在污染集上凑不出共识)。步骤:
+      1) 以 seed 中心量每个候选到中心的距离, 找票数最多的半径(容差同节圆内点容差);
+      2) 把该半径上的内点挑出来, 在**这个干净子集**上跑正常 RANSAC 重新定中心+半径;
+      3) 复核真实内点数, 不足 min_pts 就返回 None(退回否决, 绝不放宽)。
+    安全方向: 第 3 步与主路径同样自证内点数, 不会比主 RANSAC 更容易接受一个假节圆; seed
+    中心即便被视场切偏, 第 2 步重拟合也会把中心拉回内点的最小二乘解。
+    """
+    pts = pts.astype(np.float64)
+    if len(pts) < min_pts:
+        return None
+    d = np.hypot(pts[:, 0] - seed_cx, pts[:, 1] - seed_cy)
+    best_inl, best_cnt = None, 0
+    for r0 in d:
+        if r0 <= r_floor:
+            continue
+        inl = np.abs(d - r0) <= max(tol_ratio * r0, tol_min)
+        if int(inl.sum()) > best_cnt:
+            best_inl, best_cnt = inl, int(inl.sum())
+    if best_inl is None or best_cnt < min_pts:
+        return None
+    return fit_circle_ransac(pts[best_inl], iters, tol_ratio, tol_min,
+                             min_pts, r_floor, max_combos)
+
+
 def odd(v: float, lo: int = 3) -> int:
     """转成 >=lo 的奇数, 供形态学/滤波核使用。"""
     k = int(round(v))
@@ -1517,6 +1548,18 @@ def locate_part(work: np.ndarray, cand: np.ndarray,
     if big is not None:
         b = np.asarray(big[0], dtype=np.float64)
         bx, by, br = b[np.argmax(b[:, 2])]
+        # 有外圆中心时, 再试一次"锚定"节圆拟合: 用外圆中心把 3 点 RANSAC 降成半径投票,
+        # 常能救回那些 pitch_fit 拟不出、但孔确实成圆的图(反面尤多)。仍自证内点数, 拟不出
+        # 就照旧退回 boundary_circle(全孔否决), 绝不放宽。
+        if ring_pts is not None:
+            anch = fit_pitch_anchored(ring_pts, float(bx), float(by), 1.5 * r_med_ring,
+                                      PITCH_FIT_TOL_RATIO, PITCH_FIT_TOL_MIN_PX,
+                                      PITCH_FIT_MIN_HOLES, PITCH_FIT_ITERS,
+                                      PITCH_FIT_RANSAC_MAX_COMBOS)
+            if anch is not None:
+                acx, acy, apr, an_in = anch
+                if apr > 1.5 * r_med_ring and an_in >= PITCH_FIT_MIN_HOLES:
+                    return (acx, acy, apr), "pitch_fit(n=%d)" % an_in
         return (float(bx), float(by), float(br)), "boundary_circle"
 
     _, mask = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
