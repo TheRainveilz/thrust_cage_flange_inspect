@@ -206,6 +206,19 @@ FLANGE_HOUGH_P1 = 110  # 翻边圆 Hough 的 Canny 高阈值
 FLANGE_HOUGH_P2 = 20  # 翻边圆 Hough 累加器阈值: 调小=易检出(易误), 调大=易漏
 FLANGE_CENTER_GATE = 0.14  # 翻边圆圆心允许偏离孔心 / r
 
+# 翻边"领圈"深度闸(2026-09-21 新增, 见 memory: feature-a-gate-is-ring-structure)。
+# 实图确认: 正面每孔一圈又黑又粗的深色领圈(翻边立体), 反面只有细边线、无领圈。
+# A 的 hough 只查"那个半径上有没有圆", 查不到"圈黑不黑", 所以反面 47% 的孔也骗过 A。
+# darkfrac = 领圈带 [1.00,1.35]r 里 灰度 < COLLAR_DARK_RATIO*外侧亮环中位灰 的像素占比。
+# 孔级实测(975 张, on_pitch&A 孔): 正面 p50=0.270、p10=0.070; 反面 p50=0.003、p90=0.042
+#   —— 两条分布几乎不重叠。当 A 的 AND 收紧项: 结构上只增过杀、绝不增逃逸(方向永远 fail-safe)。
+# 默认关(COLLAR_GATE=False), 图片级 + 零逃逸验收通过前不改基线。开: 设 True。
+COLLAR_GATE = True   # 2026-09-21 验收锁定: 全量 975 张, 正面图片级 340 零代价, 反面 A 孔级 47%->8%, 逃逸 0
+COLLAR_DARKFRAC_MIN = 0.05  # 分布空档中点(正面孔 p10=0.070, 反面孔 p90=0.042); darkfrac>=该值 才认有真领圈
+COLLAR_BAND = (1.00, 1.35)  # 领圈带 / r
+COLLAR_OUT_BAND = (1.40, 1.65)  # 外侧亮环(参考基准) / r
+COLLAR_DARK_RATIO = 0.75  # 领圈像素 < 该比例*外侧亮环中位灰 -> 算"暗"
+
 # ---------- 7. 特征B: 4 个拐角小圆压痕 ----------
 # (相对角度°, 距离/r)。角度以"工件中心 -> 孔心"的向外径向方向为 0°, 逆时针为正,
 # 因此工件任意旋转时 4 个拐角自动跟随, 无需知道绝对角度。实测值见文件末调试说明。
@@ -1432,6 +1445,7 @@ class HoleResult:
     ring_count: int = 0  # 同心环数(特征A 主判据)
     ring_radii: List[float] = field(default_factory=list)
     flange_hough_r: Optional[float] = None
+    collar_darkfrac: float = 0.0  # 翻边领圈暗像素占比(正面深领圈->大, 反面平孔->~0)
     feature_a: bool = False
     corner_hits: List[dict] = field(default_factory=list)
     valid_marks: int = 0  # 有效小圆压痕数(特征B)
@@ -1740,6 +1754,32 @@ def feature_a_flange_hough(gray: np.ndarray, hx: float, hy: float, r: float) -> 
             if best is None or br > best:
                 best = float(br)
     return None if best is None else best / r
+
+
+def feature_a_collar_darkfrac(gray: np.ndarray, hx: float, hy: float, r: float) -> float:
+    """翻边"领圈"暗像素占比 —— A 的领圈深度判据(见常量段 COLLAR_*)。
+
+    领圈带 [COLLAR_BAND]r 里, 灰度 < COLLAR_DARK_RATIO*外侧亮环中位灰 的像素占比。
+    正面深领圈 -> 大(实测中位 0.27); 反面平孔无领圈 -> ~0(中位 0.003)。**直接在原图 gray 上量**
+    (不 local_enhance, 与诊断脚本 _diag_a_collar.py 逐字一致, 保证阈值可迁移)。定位不到基准 -> 0.0。
+    """
+    h, w = gray.shape[:2]
+    rr = r * (COLLAR_OUT_BAND[1] + 0.07)
+    x0, x1 = max(0, int(hx - rr)), min(w, int(hx + rr) + 1)
+    y0, y1 = max(0, int(hy - rr)), min(h, int(hy + rr) + 1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return 0.0
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    d = np.hypot(xs - hx, ys - hy) / max(r, 1e-6)
+    patch = gray[y0:y1, x0:x1].astype(np.float64)
+    out_m = (d >= COLLAR_OUT_BAND[0]) & (d < COLLAR_OUT_BAND[1])
+    coll_m = (d >= COLLAR_BAND[0]) & (d < COLLAR_BAND[1])
+    if out_m.sum() < 20 or coll_m.sum() < 20:
+        return 0.0
+    surround = float(np.median(patch[out_m]))
+    if surround < 1.0:
+        return 0.0
+    return float((patch[coll_m] < COLLAR_DARK_RATIO * surround).mean())
 
 
 # ------------------------------------------------------------------ 特征B: 拐角小圆压痕
@@ -2100,6 +2140,11 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
             hole.feature_a = a_contour and a_hough
         else:
             hole.feature_a = a_contour or a_hough
+        # 领圈深度闸: 始终测(留诊断/CSV), 但只有 COLLAR_GATE 打开时才 AND 进 feature_a。
+        # AND 一个额外要求只会否决更多孔 -> 结构上只增过杀、绝不增逃逸。
+        hole.collar_darkfrac = feature_a_collar_darkfrac(gray, hole.cx, hole.cy, hole.r)
+        if COLLAR_GATE and hole.feature_a:
+            hole.feature_a = hole.collar_darkfrac >= COLLAR_DARKFRAC_MIN
         feature_a_ms = contour_ms + hough_ms
         feature_a_total += feature_a_ms
 
