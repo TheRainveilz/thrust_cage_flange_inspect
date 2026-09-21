@@ -960,13 +960,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def summarise(n_ok: int, n_ng: int, n_bad: int, hit: int, miss: int,
               stages: Dict[str, int], n_ver: int, csv_path: str, sheet_dir: str,
-              n_sheet: int, n_border: int, t0: float) -> None:
+              n_sheet: int, n_border: int, t0: float, truth_src: str = "真值") -> None:
     print("=" * 108)
     print("[汇总] 共 %d 帧: OK=%d NG=%d 无效=%d   耗时 %.1f s"
           % (n_ok + n_ng, n_ok, n_ng, n_bad, time.time() - t0))
     if hit + miss:
-        print("[自检] 文件名可推断真值 %d 张: 一致 %d, 不一致 %d (准确率 %.1f%%)"
-              % (hit + miss, hit, miss, 100.0 * hit / (hit + miss)))
+        # truth_src 说明真值到底来自哪(目录/强制/文件名), 别再一律写"文件名"误导。
+        print("[自检] 真值来源=%s, 有真值 %d 张: 判定一致 %d, 不一致 %d (准确率 %.1f%%)"
+              % (truth_src, hit + miss, hit, miss, 100.0 * hit / (hit + miss)))
     total = sum(stages.values())
     if total:
         order = ("ok", "low_circ", "seg_miss", "gate_miss", "hough_miss", "oof")
@@ -1079,7 +1080,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         fh.close()
     summarise(n_ok, n_ng, n_bad, hit, miss, stages, n_ver, csv_path, sheet_dir,
-              n_sheet, n_border, t0)
+              n_sheet, n_border, t0, truth_src)
     if args.sweep:
         sweep_table(sweep_data)
     if args.sweep_r is not None:
