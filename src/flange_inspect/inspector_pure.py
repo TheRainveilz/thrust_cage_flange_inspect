@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import itertools
 import json
 import logging
 import os
@@ -112,7 +113,7 @@ CAMERA_URL_TEMPLATE = "http://{camera_ip}/camera/currentImage"
 HTTP_TIMEOUT_S = 2.0  # 单帧取图超时(s)
 HTTP_INTERVAL_S = 0.20  # 连续取图间隔(s)
 HTTP_MAX_FRAMES = 0  # 上线取 0 = 无限循环; 调试可设有限帧数
-HTTP_RETRY = 3  # 取图失败重试次数
+HTTP_RETRY = 15  # 取图失败重试次数
 HTTP_USE_SYSTEM_PROXY = False  # 本机装了系统代理(Clash 等)时必须为 False:
 #   requests 默认读 Windows 系统代理设置, 会把相机 IP
 #   也丢给代理(实测报 127.0.0.1:7892 ReadTimeout)
@@ -157,6 +158,7 @@ PITCH_FIT_MIN_HOLES = 3  # 少于该数无法拟合节圆 -> 走兜底定位
 PITCH_FIT_ITERS = 6  # 节圆稳健拟合的重加权迭代次数(逐次剔离群孔); 越大越稳但越慢
 PITCH_FIT_TOL_RATIO = 0.06  # 内点容差 / 节圆半径
 PITCH_FIT_TOL_MIN_PX = 8.0  # 内点容差下限(px)
+PITCH_FIT_RANSAC_MAX_COMBOS = 4000  # 节圆 RANSAC 枚举 3 点子集的上限; 超过则用固定种子抽样(可复现)
 OUTER_R_MIN_RATIO = 0.18  # 兜底: 外圆/中心大孔 Hough 半径范围 / 图像宽度
 OUTER_R_MAX_RATIO = 0.60  # 兜底外圆半径上限 / 图像宽度(与上面的 MIN 一起框定搜索范围)
 OUTER_HOUGH_P2 = 90  # 兜底外圆 Hough 累加器阈值: 比孔用的更高, 只认证据充分的大圆, 防误检
@@ -176,10 +178,19 @@ USE_GLOBAL_HOLE_RADIUS = True  # True=用所有孔半径中位数做统一基准
 HOLE_R_DEV_MAX = 0.25  # 单孔半径偏离中位数超过该比例 -> 该孔判为无效
 
 # ---------- 6. 特征A: 翻边外圈 (孔 ROI 内轮廓计数) ----------
-# 实测结论(见文末调试说明): "轮廓计数"在反面也可能计到 2 圈(单圈冲裁边的内外沿),
-# 鉴别力弱于"同心 Hough 找翻边圆"。因此默认 contour_or_hough, 且 HOLE_LOGIC 必须保持 AND,
-# 由特征B(拐角压痕)提供主要鉴别力。若现场出现反面误判 OK, 先改 contour_and_hough。
-FEATURE_A_MODE = "contour_or_hough"  # "contour" / "hough" / "contour_or_hough" / "contour_and_hough"
+# 注意: A 不测深度, 它判的是"孔的 [0.86r, 1.36r] 环带里有没有同心环状边缘"。
+# 物理上反面(NG)是冲穿的, 环边是剪切出的薄锐边(无深度), 所以反面必然也有同心环 ——
+# 这就是 A 在反面不设防的结构性原因, 不是参数问题(见 memory: feature-a-gate-is-ring-structure)。
+#
+# 2026-09-21 全量 975 张四档扫描 (tools/_diag_feature_a_sweep.py) 结论: 判别力几乎全在
+# hough 分支(孔级通过率 正面 96.4% vs 反面 47.0%), contour 分支正反面几乎不可分
+# (56.7% vs 50.9%, 即"单圈冲裁边的内外沿"在反面同样计到 2 圈) —— 且 contour 被 hough
+# 严格支配(单跑 contour: 正面 269 张 + 反面裕度 299; 单跑 hough: 正面 290 张 + 反面裕度 265)。
+# 原 "or" 逻辑等于用弱分支淹掉强分支。改 hough 是**零代价**: 正面召回 290 = 290 不变,
+# 反面"节圆上已有过A孔、只等压痕"的图 312 -> 265。
+# HOLE_LOGIC 必须保持 AND; 特征B(拐角压痕)仍是主要鉴别力。
+# contour_and_hough 更严(反面裕度 218), 但代价 23 张正面召回(290->267), 留作后备。
+FEATURE_A_MODE = "hough"  # "contour" / "hough" / "contour_or_hough" / "contour_and_hough"
 RING_ROI_RATIO = 1.48  # 孔 ROI 外扩倍数 (含翻边区域)
 RING_MASK_RATIO = 1.42  # ROI 内圆形掩膜半径 / r, 屏蔽相邻孔与拐角压痕干扰
 RING_BAND = (0.86, 1.36)  # 只接受平均半径落在该环带内的轮廓 / r
@@ -233,8 +244,11 @@ PART_MIN_PASS_HOLES = 1  # PART_LOGIC="OR" 下, 需要多少个受检孔同时(A
 # 方向永远偏 fail-safe: 一个合法孔都没有 -> 全孔否决 -> NG。实测代价: 正面召回 92.0% -> 81.8%
 # (过杀 +10%, 按"真实 NG 绝不可判 OK"铁律可接受), 反面逃逸 0/623 不变。回退: 设 False。
 HOLE_PITCH_GATE = True
-HOLE_PITCH_TOL_RATIO = PITCH_FIT_TOL_RATIO  # 内点容差, 与节圆拟合 fit_circle_robust 自身一致
-# 只在 pitch_fit 定位下生效: boundary_circle 的 pitch_r 是"外圆半径", 拿它当节圆判据是错的。
+HOLE_PITCH_TOL_RATIO = PITCH_FIT_TOL_RATIO  # 内点容差, 与节圆拟合 fit_circle_ransac 自身一致
+# 只有 pitch_fit 的 pitch_r 才真的是"孔心圆"; boundary_circle 给的是**外圆半径**, 拿它验证孔位
+# 没有意义 -> 这类定位下所有孔一律判为"不在节圆上"(fail-safe: 无法验证就不放行)。
+# 2026-09-21 实测教训: 早先版本对非 pitch_fit 直接**关掉**闸, 结果 410 张反面图在"定位最不可信"
+# 的状态下变成无闸放行, 立刻冒出 3 张 NG->OK 逃逸。方向必须反过来: 定位越不可信, 闸越要否决。
 HOLE_PITCH_GATE_METHODS = ("pitch_fit",)
 
 # ---------- 9. 调试 / 存图 ----------
@@ -380,7 +394,14 @@ def fit_circle_lsq(pts: np.ndarray) -> Tuple[float, float, float]:
 
 def fit_circle_robust(pts: np.ndarray, iters: int, tol_ratio: float,
                       tol_min: float, min_pts: int) -> Optional[Tuple[float, float, float, int]]:
-    """迭代剔野点的圆拟合, 返回 (cx, cy, r, 内点数)。"""
+    """迭代剔野点的圆拟合, 返回 (cx, cy, r, 内点数)。
+
+    注意(2026-09-21 实测): 这是"从全量点出发的迭代剔野", 不是 RANSAC。首轮内点不足
+    (`keep.sum() < min_pts`)时会 break, 但此时 `cur` 还没被收窄 —— 返回的圆其实一个点都
+    支撑不住, 报出的内点数却是全量点数。反面 69% 的图踩到了这条, 于是 locate_part 靠假的
+    n_in 接受了一个假节圆。节圆拟合已改用 fit_circle_ransac; 这里保留原语义供 refine_hole 用
+    (它丢弃 n_in, 另有 REFINE_SCAN_BAND 兜底, 影响面小)。
+    """
     if len(pts) < min_pts:
         return None
     cur = pts.astype(np.float64)
@@ -393,6 +414,57 @@ def fit_circle_robust(pts: np.ndarray, iters: int, tol_ratio: float,
             break
         cur = cur[keep]
     return cx, cy, r, int(len(cur))
+
+
+def count_circle_inliers(pts: np.ndarray, cx: float, cy: float, r: float,
+                         tol_ratio: float, tol_min: float) -> int:
+    """给定圆的真实内点数(容差规则与 fit_circle_robust 完全一致)。"""
+    tol = max(tol_ratio * r, tol_min)
+    return int((np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r) < tol).sum())
+
+
+def fit_circle_ransac(pts: np.ndarray, iters: int, tol_ratio: float, tol_min: float,
+                      min_pts: int, r_floor: float,
+                      max_combos: int) -> Optional[Tuple[float, float, float, int]]:
+    """真 RANSAC 圆拟合: 枚举 3 点子集取最大共识集, 再对共识集迭代重拟合。
+
+    与 fit_circle_robust 的关键差别: **报出的内点数永远是返回圆的真实内点数**(用它自己的
+    容差重新数一遍), 支撑不足 min_pts 就返回 None。这样"内点数"才配当接受条件用。
+    抽样用固定种子 -> 同一张图每次跑结果一致(判定必须可复现)。
+    """
+    pts = pts.astype(np.float64)
+    n = len(pts)
+    if n < min_pts:
+        return None
+    combos: List[Tuple[int, ...]] = list(itertools.combinations(range(n), 3))
+    if len(combos) > max_combos:
+        rng = np.random.default_rng(20260921)
+        sel = rng.choice(len(combos), max_combos, replace=False)
+        combos = [combos[i] for i in sel]
+    best = None
+    for tri in combos:
+        cx, cy, r = fit_circle_lsq(pts[list(tri)])
+        if not np.isfinite((cx, cy, r)).all() or r <= r_floor:
+            continue
+        k = count_circle_inliers(pts, cx, cy, r, tol_ratio, tol_min)
+        if best is None or k > best[3]:
+            best = (cx, cy, r, k)
+    if best is None or best[3] < min_pts:
+        return None
+    cx, cy, r, _ = best
+    for _ in range(max(1, iters)):  # 共识集上迭代重拟合(收敛到所有内点的最小二乘解)
+        keep = (np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r)
+                < max(tol_ratio * r, tol_min))
+        if keep.sum() < min_pts:
+            break
+        nx, ny, nr = fit_circle_lsq(pts[keep])
+        if not np.isfinite((nx, ny, nr)).all() or nr <= r_floor:
+            break
+        cx, cy, r = nx, ny, nr
+    k = count_circle_inliers(pts, cx, cy, r, tol_ratio, tol_min)
+    if k < min_pts:
+        return None
+    return cx, cy, r, k
 
 
 def odd(v: float, lo: int = 3) -> int:
@@ -1408,20 +1480,33 @@ def detect_hole_candidates(work: np.ndarray) -> np.ndarray:
     return cand
 
 
-def locate_part(work: np.ndarray, cand: np.ndarray) -> Tuple[Optional[Tuple[float, float, float]], str]:
+def locate_part(work: np.ndarray, cand: np.ndarray,
+                refined: Optional[List[Tuple[float, float, float, float]]] = None
+                ) -> Tuple[Optional[Tuple[float, float, float]], str]:
     """自动定位工件(不用固定 ROI), 三级策略。返回 ((cx,cy,pitch_r), 方法名)。
 
     1) 节圆拟合: 孔心共圆 -> 工件中心/节圆半径, 对任意旋转偏移天然免疫,
-       外圆被视场切掉也有效(现场半幅视野样图)。
+       外圆被视场切掉也有效(现场半幅视野样图)。**优先用精定位(refine_hole)后的孔心**:
+       粗 Hough 候选里混着大量伪圆(反面上尤其多), 精定位会把心拉到真正的孔壁上, 共识集才干净
+       (实测有 >=3 个真内点的图: 前沿 83.5%->85.5%, 反面 34.2%->52.5%)。
     2) 大圆 Hough: 直接找垫片外圆或中心大孔。
     3) 工件掩膜质心: 最后兜底。
     """
-    if len(cand) >= PITCH_FIT_MIN_HOLES:
-        fit = fit_circle_robust(cand[:, :2], PITCH_FIT_ITERS, PITCH_FIT_TOL_RATIO,
-                                PITCH_FIT_TOL_MIN_PX, PITCH_FIT_MIN_HOLES)
+    ring_pts, r_med_ring = None, 0.0
+    if refined and len(refined) >= PITCH_FIT_MIN_HOLES:
+        ring_pts = np.array([[q[0], q[1]] for q in refined], np.float64)
+        r_med_ring = float(np.median([q[2] for q in refined]))
+    if ring_pts is None and len(cand) >= PITCH_FIT_MIN_HOLES:
+        ring_pts, r_med_ring = cand[:, :2].astype(np.float64), float(np.median(cand[:, 2]))
+    if ring_pts is not None:
+        # 用真 RANSAC(枚举 3 点子集)而不是迭代剔野: 后者在首轮内点不足时会谎报内点数,
+        # 让一个毫无支撑的假圆被当成节圆接受(反面 69% 的图踩过)。
+        fit = fit_circle_ransac(ring_pts, PITCH_FIT_ITERS, PITCH_FIT_TOL_RATIO,
+                                PITCH_FIT_TOL_MIN_PX, PITCH_FIT_MIN_HOLES,
+                                1.5 * r_med_ring, PITCH_FIT_RANSAC_MAX_COMBOS)
         if fit is not None:
             cx, cy, pr, n_in = fit
-            if pr > 1.5 * float(np.median(cand[:, 2])) and n_in >= PITCH_FIT_MIN_HOLES:
+            if pr > 1.5 * r_med_ring and n_in >= PITCH_FIT_MIN_HOLES:
                 return (cx, cy, pr), "pitch_fit(n=%d)" % n_in
 
     w = work.shape[1]
@@ -1875,10 +1960,20 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
     stage_done("preprocess")
     cand = detect_hole_candidates(work)
     stage_done("hole_candidates")
-    part, method = locate_part(work, cand)
+    # 先精定位再定位工件: refine_hole 不需要工件中心, 而节圆拟合在精定位孔心上更干净。
+    ang = np.radians(np.arange(0.0, 360.0, REFINE_ANGLE_STEP_DEG))
+    cos_t, sin_t = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    refined: List[Tuple[float, float, float, float]] = []
+    for (x0, y0, r0) in cand:
+        got = refine_hole(work, float(x0), float(y0), float(r0), cos_t, sin_t)
+        if got is not None:
+            refined.append(got)
+    stage_done("hole_refine")
+    part, method = locate_part(work, cand, refined)
     stage_done("part_locate")
     res.locate_method = method
     res.timing_details["candidate_holes"] = len(cand)
+    res.timing_details["refined_holes"] = len(refined)
     if part is None:
         res.verdict = NG_PART_NOT_FOUND
         res.reason = "定位失败: 图中找不到垫片"
@@ -1895,16 +1990,6 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
         res.verdict = NG_HOLE_NOT_FOUND
         res.reason = "圆孔候选不足: %d < %d" % (len(cand), MIN_HOLE_COUNT)
         return finish()
-
-    ang = np.radians(np.arange(0.0, 360.0, REFINE_ANGLE_STEP_DEG))
-    cos_t, sin_t = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
-    refined: List[Tuple[float, float, float, float]] = []
-    for (x0, y0, r0) in cand:
-        got = refine_hole(work, float(x0), float(y0), float(r0), cos_t, sin_t)
-        if got is not None:
-            refined.append(got)
-    stage_done("hole_refine")
-    res.timing_details["refined_holes"] = len(refined)
     if len(refined) < MIN_HOLE_COUNT:
         res.verdict = NG_HOLE_NOT_FOUND
         res.reason = "精定位后有效圆孔不足: %d < %d" % (len(refined), MIN_HOLE_COUNT)
@@ -1915,7 +2000,9 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
     res.hole_r = r_med
     holes: List[HoleResult] = []
     h_img, w_img = gray.shape[:2]
-    gate_on = HOLE_PITCH_GATE and method.split("(")[0] in HOLE_PITCH_GATE_METHODS
+    gate_on = HOLE_PITCH_GATE
+    # 非 pitch_fit(boundary_circle / mask_centroid)拿不到节圆 -> 无孔可验证 -> 全部否决(fail-safe)
+    fit_is_ring = method.split("(")[0] in HOLE_PITCH_GATE_METHODS
     for i, (hx, hy, hr, contrast) in enumerate(refined):
         if abs(hr - r_med) / max(r_med, 1e-6) > HOLE_R_DEV_MAX:
             continue
@@ -1924,8 +2011,8 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
         in_frame = (margin <= hx < w_img - margin) and (margin <= hy < h_img - margin)
         holes.append(HoleResult(index=i, cx=hx, cy=hy, r=r_use, contrast=contrast,
                                 in_frame=in_frame,
-                                on_pitch=(not gate_on) or hole_on_pitch(
-                                    hx, hy, res.part_cx, res.part_cy, res.pitch_r)))
+                                on_pitch=(not gate_on) or (fit_is_ring and hole_on_pitch(
+                                    hx, hy, res.part_cx, res.part_cy, res.pitch_r))))
     if len(holes) < MIN_HOLE_COUNT:
         res.verdict = NG_HOLE_NOT_FOUND
         res.reason = "孔径一致性筛选后不足: %d < %d" % (len(holes), MIN_HOLE_COUNT)
