@@ -91,6 +91,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--feature-a-mode", default=None,
                     choices=("contour", "hough", "contour_or_hough", "contour_and_hough"),
                     help="覆盖 FEATURE_A_MODE，决定特征A用哪个分支；默认用模块当前值")
+    ap.add_argument("--collar-gate", action="store_true",
+                    help="打开翻边领圈深度闸(COLLAR_GATE=True)：给特征A加'领圈够黑'的AND要求；"
+                         "结构上只增过杀、绝不增逃逸。默认按模块当前值(关)")
+    ap.add_argument("--collar-min", type=float, default=None,
+                    help="覆盖 COLLAR_DARKFRAC_MIN 阈值(默认用模块值)；配合 --collar-gate 扫阈值")
     return ap.parse_args()
 
 
@@ -264,6 +269,17 @@ def main() -> int:
             print("[WARN] %s 无 FEATURE_A_MODE, 忽略 --feature-a-mode" % args.impl)
     if hasattr(T, "FEATURE_A_MODE"):
         print("[INFO] FEATURE_A_MODE:", T.FEATURE_A_MODE)
+    # 翻边领圈深度闸(见 inspector_pure.COLLAR_GATE)。实图确认正面深领圈/反面平孔, 孔级
+    # darkfrac 正反面几乎不重叠(正 p50=0.27 / 反 p50=0.003)。打开即给 A 加"领圈够黑"的 AND。
+    if args.collar_min is not None and hasattr(T, "COLLAR_DARKFRAC_MIN"):
+        T.COLLAR_DARKFRAC_MIN = args.collar_min
+    if args.collar_gate:
+        if hasattr(T, "COLLAR_GATE"):
+            T.COLLAR_GATE = True
+        else:
+            print("[WARN] %s 无 COLLAR_GATE, 忽略 --collar-gate" % args.impl)
+    if hasattr(T, "COLLAR_GATE"):
+        print("[INFO] COLLAR_GATE:", T.COLLAR_GATE, " COLLAR_DARKFRAC_MIN:", T.COLLAR_DARKFRAC_MIN)
     rows = []
     for index, path in enumerate(paths, 1):
         row = inspect_one(T, path)
