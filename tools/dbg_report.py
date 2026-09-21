@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -86,8 +87,8 @@ def check_corner_keys(rec: dict) -> None:
 # 主算法文件是交付件不改, 所以样本/输出目录的本地覆盖放在这里。
 # 留空 = 沿用主模块的 LOCAL_IMAGE_DIR 与 NG_SAVE_DIR 的父目录。
 # 优先级: 命令行 --dir/--out  >  环境变量 DBG_DIR/DBG_OUT  >  下面两行  >  主模块常量
-IMAGE_DIR = r""        # 样本目录, 例: r"D:\新建文件夹\WTX3000-360C (DA7486717)"
-OUT_DIR   = r""        # 输出根目录(CSV 与 sheet/ 都放这下面), 例: r"D:\zq\result"
+IMAGE_DIR = r""        # 样本目录, 例: r"D:\tcage_flange_inspect\sample_images"
+OUT_DIR   = r""        # 输出根目录(CSV 与 sheet/ 都放这下面), 例: r"D:\dev\repos\thrust_cage_flange_inspect\artifacts\dbg\sheet"
 
 
 def default_image_dir() -> str:
@@ -105,6 +106,38 @@ def default_out_dir() -> str:
             or os.path.join(_REPO_ROOT, "artifacts", "dbg"))
 
 
+def truth_from_folder(name: str):
+    """按路径里的 OK/ 或 NG/ 子目录取真值。手动分好类的目录(imageDataClass)用这个最准。
+
+    返回 True=正面/OK, False=反面/NG, None=路径里既没 ok 也没 ng(交给上层回落)。
+    大小写不敏感, 逐段比对目录名, 避免文件名里偶然含 'ok' 造成误判。
+    """
+    parts = [p.lower() for p in re.split(r"[\\/]+", name) if p]
+    for p in parts[:-1]:            # 只看目录段, 不看文件名本身
+        if p in ("ok", "front", "正面", "good"):
+            return True
+        if p in ("ng", "back", "反面", "bad"):
+            return False
+    return None
+
+
+def make_truth_fn(mode):
+    """真值来源工厂。mode: front/back=强制整批一类; folder=按目录; 其它=guess_label 推断。
+
+    folder 模式下若某张图路径里没有 OK/NG 段, 回落到 guess_label(), 不会静默判错。
+    """
+    if mode == "front":
+        return lambda name: True
+    if mode == "back":
+        return lambda name: False
+    if mode == "folder":
+        def _fn(name):
+            t = truth_from_folder(name)
+            return t if t is not None else T.guess_label(name)
+        return _fn
+    return T.guess_label
+
+
 # ---------------------------------------------------------------- 版式 / 配色
 CELL = 200                    # 单元格边长(px)。拐角窗口 2*0.75*r≈76px -> 放大约 2.6 倍
 CONTEXT_RATIO = 2.9           # 上下文裁切半宽 / r。拐角最远 1.79r + 方框半对角 1.06r = 2.85r
@@ -113,6 +146,7 @@ BORDERLINE_BAND = 0.07        # |maxcirc - MARK_CIRCULARITY_MIN| 落在该带内
 SWEEP_TC = (0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)   # --sweep 的圆度阈值网格
 SWEEP_TM = (1, 2, 3, 4)                                  # --sweep 的最少压痕数网格
 SWEEP_R_UPPER = (0.55, 0.50, 0.47, 0.45, 0.42, 0.40)     # --sweep-radius 的半径上界网格
+SWEEP_P2 = (14, 12, 10, 9, 8, 7, 6)                      # --sweep-p2 的 MARK_HOUGH_P2 网格(降=更灵敏)
 
 GREEN, RED, YELLOW, GRAY = (0, 220, 0), (0, 0, 255), (0, 220, 220), (140, 140, 140)
 BLUE, CYAN, MAGENTA, OLIVE, ORANGE = (255, 120, 0), (255, 255, 0), (255, 0, 255), (200, 200, 0), (0, 150, 255)
@@ -233,7 +267,10 @@ def classify_corner(gray: np.ndarray, clahe_only: Optional[np.ndarray],
     if clahe_only is not None:
         win_enh, _ = T.crop_pad(clahe_only, rec["cx"], rec["cy"], half)
 
-    if "mark_r" in rec:
+    if float(rec.get("mark_r", 0.0)) > 0.0:
+        # 主模块调试模式给所有 in_frame 拐角预填 mark_r=0.0, 只有真正选出候选圆才 >0。
+        # 所以判据是 mark_r>0 而不是 "mark_r" in rec —— 否则 hough_miss/gate_miss 会被
+        # 错打成 seg_miss(br=0 算出圆度恒 0), 诊断失真。
         # 反推检测时的 Hough 候选圆(模块记的是图像坐标, 这里换回窗口坐标)。
         # 必须过一遍 float32: HoughCircles 的圆心恒为 x.5, 而 (cx+d)-cx 的浮点余差约 1e-13,
         # 正好让 round() 的银行家舍入在 .5 处翻边(round(36.5)=36 但 round(36.5+1e-13)=37),
@@ -534,22 +571,56 @@ def sheet_name(res, per_hole, truth: Optional[bool]) -> Tuple[str, bool]:
 
 
 # ---------------------------------------------------------------- 阈值网格 (--sweep)
+DYNAMIC_GATE = 0.32          # 主模块 feature_b_corner_marks 里动态 ROI 的中心门(硬编码值)
+
+
 def collect_sweep(res, holes, truth: Optional[bool]) -> dict:
-    """把一张图压成阈值重算所需的最小信息。circ 与 MARK_CIRCULARITY_MIN 无关,
-    所以整片 (圆度阈值 x 最少压痕数) 网格都能从一次检测的结果解析式推出, 不必重跑。"""
+    """把一张图压成阈值重算所需的最小信息。
+
+    主模块的接受判据现在是"软接受":
+        accepted = circ_raw > MARK_CIRCULARITY_MIN
+                   or (position_ok and shape_ok)         # 见 _corner_accepted
+    circ_raw 那半随圆度阈值 tc 变(能解析式扫), 但软接受那半与 tc 无关 —— 所以要连
+    center_offset/radius_ratio/circ_enhanced/dynamic_roi 一起记下来, 才能在网格里复算真实判定。
+    近似: 主模块选候选圆时排序键含 accepted(用当前 MARK_CIRCULARITY_MIN), 换 tc 理论上可能改选
+    另一个候选; 这里只记赢的那个候选, 属二阶近似(与 --sweep-radius 同量级), 逐帧 CSV 不受影响。
+    """
+    def corner_info(rec: dict) -> dict:
+        return {"circ_raw": float(rec.get("circ_raw", rec.get("circ", 0.0))),
+                "circ_enh": float(rec.get("circ_enhanced", 0.0)),
+                "offset": float(rec.get("center_offset", 9.9)),
+                "rratio": float(rec.get("radius_ratio", 0.0)),
+                "dyn": bool(rec.get("dynamic_roi", False))}
     return {"truth": truth, "is_ok": res.is_ok, "verdict": res.verdict,
             "holes": [{"feature_a": bool(hole.feature_a),
-                       "circs": [rec["circ"] for rec in hole.corner_hits if rec["in_frame"]]}
+                       "corners": [corner_info(rec) for rec in hole.corner_hits if rec["in_frame"]]}
                       for hole in holes]}
 
 
+def _corner_accepted(c: dict, tc: float) -> bool:
+    """复刻主模块单个拐角的接受判据(软接受)。tc 替换 MARK_CIRCULARITY_MIN 那道硬阈值。"""
+    if c["circ_raw"] > tc:
+        return True
+    if getattr(T, "FEATURE_B_DISABLE_SOFT_ACCEPT", False):
+        return False                                          # 收紧模式: 只认硬阈值
+    gate = DYNAMIC_GATE if c["dyn"] else T.MARK_CENTER_GATE
+    position_ok = c["offset"] <= gate
+    shape_ok = (0.28 <= c["rratio"] <= 0.55 and c["circ_enh"] > 0.45 and c["circ_raw"] > 0.10)
+    return bool(position_ok and shape_ok)
+
+
+def _hole_marks(h: dict, tc: float) -> int:
+    """单孔在阈值 tc 下的有效压痕数(按软接受判据)。"""
+    return sum(1 for c in h["corners"] if _corner_accepted(c, tc))
+
+
 def verdict_at(item: dict, tc: float, tm: int) -> bool:
-    """在给定 (圆度阈值, 最少压痕数) 下重算工件判定, 逻辑与主模块一致。"""
+    """在给定 (圆度阈值, 最少压痕数) 下重算工件判定, 逻辑与主模块一致(含软接受)。"""
     if not item["holes"]:
         return False                                          # 早退 NG: 根本没算到特征
     flags = []
     for h in item["holes"]:
-        fb = sum(1 for c in h["circs"] if c > tc) >= tm
+        fb = _hole_marks(h, tc) >= tm
         flags.append((h["feature_a"] and fb) if T.HOLE_LOGIC == "AND" else (h["feature_a"] or fb))
     return any(flags) if T.PART_LOGIC == "OR" else all(flags)
 
@@ -560,6 +631,7 @@ def margin_at(item: dict, tc: float, tm: int) -> Optional[int]:
     判 OK 的样本: 决定性的那个孔还能掉几个压痕才翻 NG (>=0)。
     判 NG 的样本: 最接近的那个孔还要再冒几个误检才翻 OK (>=1)。
     None = 该判定不由压痕数决定(特征A 一票否决 / 早退 NG), 加减压痕都翻不动。
+    注意: 软接受的压痕与 tc 无关, 提高 tc 也去不掉, 所以这里的裕度是"按当前判据还差几个"。
     """
     holes = item["holes"]
     if not holes:
@@ -572,7 +644,7 @@ def margin_at(item: dict, tc: float, tm: int) -> Optional[int]:
         if any(h["feature_a"] for h in holes):                 # OR: 特征A 单独定调
             return None
         usable = holes
-    counts = [sum(1 for c in h["circs"] if c > tc) for h in usable]
+    counts = [_hole_marks(h, tc) for h in usable]
     key = max(counts) if T.PART_LOGIC == "OR" else min(counts)  # OR 看最强孔, AND 看最弱孔
     return (key - tm) if verdict_at(item, tc, tm) else (tm - key)
 
@@ -695,11 +767,11 @@ def recommend(front: List[dict], back: List[dict]) -> None:
 
 # ---------------------------------------------------------------- 半径网格 (--sweep-radius)
 def total_marks(items: List[dict], tc: float) -> int:
-    return sum(sum(1 for c in h["circs"] if c > tc) for d in items for h in d["holes"])
+    return sum(_hole_marks(h, tc) for d in items for h in d["holes"])
 
 
 def radius_scan(src, limit: int, uppers: Sequence[float],
-                forced: Optional[bool] = None) -> List[Tuple[float, List[dict]]]:
+                truth_fn) -> List[Tuple[float, List[dict]]]:
     """按 MARK_R_RATIO_RANGE 上界逐个重跑全部样本。
 
     圆度阈值与压痕数能解析式扫(circ 与它们无关), 但半径范围是 HoughCircles 的
@@ -707,8 +779,9 @@ def radius_scan(src, limit: int, uppers: Sequence[float],
     圆), 事后筛已记录的命中只能做减法, 推不出这种改选。所以这一维只能重跑。
     """
     lo = T.MARK_R_RATIO_RANGE[0]
-    saved_range, saved_print = T.MARK_R_RATIO_RANGE, T.PRINT_DEBUG
-    T.PRINT_DEBUG = False                                      # 6 个上界 x N 张, 逐帧表格太吵
+    saved_range = T.MARK_R_RATIO_RANGE
+    T.PRINT_DEBUG = True    # 必须开: collect_sweep 依赖 corner_hits 里的 circ_raw 等调试字段。
+    #   inspect() 本身不打印(print_result 只在 inspector.main() 调), 开着不会刷屏。
     out: List[Tuple[float, List[dict]]] = []
     try:
         for up in uppers:
@@ -723,12 +796,11 @@ def radius_scan(src, limit: int, uppers: Sequence[float],
                 if bgr is None:
                     continue
                 res, _ = T.inspect(bgr, name)
-                data.append(collect_sweep(res, checked_holes(res),
-                                          forced if forced is not None else T.guess_label(name)))
+                data.append(collect_sweep(res, checked_holes(res), truth_fn(name)))
             out.append((up, data))
             print("  上界 %.2f 完成 (%d 张)" % (up, len(data)))
     finally:
-        T.MARK_R_RATIO_RANGE, T.PRINT_DEBUG = saved_range, saved_print
+        T.MARK_R_RATIO_RANGE = saved_range
     return out
 
 
@@ -775,6 +847,85 @@ def radius_table(scan: List[Tuple[float, List[dict]]], csv_path: str) -> None:
         print("       掉得快说明正面压痕本来就靠大半径命中撑着, 收紧会连正面一起杀。")
 
 
+# ---------------------------------------------------------------- Hough P2 网格 (--sweep-p2)
+def p2_scan(src, limit: int, p2s: Sequence[int],
+            truth_fn) -> List[Tuple[int, List[dict]]]:
+    """按 MARK_HOUGH_P2 逐个重跑全部样本。
+
+    P2 是 HoughCircles 的累加器阈值 —— 降低它让更弱的圆也能被检出(救回红框拐角),
+    但同时会在 NG 件上冒出假圆(逃逸风险)。这一维和半径一样只能重跑: 改 P2 直接改变
+    Hough 找到的圆本身, 无法从已记录的命中解析式推出。
+    """
+    saved_p2 = T.MARK_HOUGH_P2
+    T.PRINT_DEBUG = True    # collect_sweep 依赖 corner_hits 调试字段; inspect 不打印, 不刷屏。
+    out: List[Tuple[int, List[dict]]] = []
+    try:
+        for p2 in p2s:
+            T.MARK_HOUGH_P2 = int(p2)
+            data: List[dict] = []
+            for idx, (name, bgr) in enumerate(src.frames()):
+                if limit and idx >= limit:
+                    break
+                if bgr is None:
+                    continue
+                res, _ = T.inspect(bgr, name)
+                data.append(collect_sweep(res, checked_holes(res), truth_fn(name)))
+            out.append((int(p2), data))
+            print("  P2=%d 完成 (%d 张)" % (p2, len(data)))
+    finally:
+        T.MARK_HOUGH_P2 = saved_p2
+    return out
+
+
+def p2_table(scan: List[Tuple[int, List[dict]]], csv_path: str) -> None:
+    """P2 网格表: 左半是收益(正面召回/压痕总数), 右半是代价与红线(反面逃逸/裕度)。
+
+    选 P2 的铁律和圆度阈值一样: 硬约束反面 0 逃逸, 在此前提下挑正面召回最高的 P2。
+    降 P2 救回红框拐角是收益, 但只要有一张反面翻成 OK 就是逃逸, 那个 P2 直接淘汰。
+    """
+    tc0, tm0 = T.MARK_CIRCULARITY_MIN, T.MIN_VALID_MARKS
+    print("=" * 108)
+    print("[Hough P2 网格] 行 = MARK_HOUGH_P2 (越低越灵敏), 每行重跑一次检测。现行 P2=%d" % tc0
+          if False else
+          "[Hough P2 网格] 行 = MARK_HOUGH_P2 (越低越灵敏), 每行重跑一次检测。当前 circmin=%.2f/tm=%d"
+          % (tc0, tm0))
+    print("    P2 | 正面压痕 反面压痕 | 正面OK/总  反面逃逸  反面裕度 | 是否零逃逸")
+    recs = []
+    for p2, data in scan:
+        front = [d for d in data if d["truth"] is True]
+        back = [d for d in data if d["truth"] is False]
+        f_ok = sum(1 for d in front if verdict_at(d, tc0, tm0))
+        esc = sum(1 for d in back if verdict_at(d, tc0, tm0))
+        bm = min_margin(back, tc0, tm0) if back else None
+        safe = "是" if (back and esc == 0) else ("否(%d 逃逸)" % esc if back else "无反面")
+        print("   %3d | %6d   %6d   | %5d/%-4d %6d   %7s   | %s"
+              % (p2, total_marks(front, tc0), total_marks(back, tc0),
+                 f_ok, len(front), esc, fmt_margin(bm), safe))
+        recs.append([p2, len(front), len(back), total_marks(front, tc0), total_marks(back, tc0),
+                     f_ok, esc, fmt_margin(bm), int(bool(back and esc == 0))])
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(("hough_p2", "n_front", "n_back", "front_marks", "back_marks",
+                    "front_ok", "back_escape", "back_margin", "zero_escape"))
+        w.writerows(recs)
+    print("[输出] P2 网格 CSV  %s" % csv_path)
+    # 在零逃逸的 P2 里挑正面召回最高的, 直接给推荐
+    safe_rows = [(f, p2) for p2, data in scan
+                 for f in [sum(1 for d in data if d["truth"] is True and verdict_at(d, tc0, tm0))]
+                 for back in [[d for d in data if d["truth"] is False]]
+                 if back and sum(1 for d in back if verdict_at(d, tc0, tm0)) == 0]
+    print("-" * 108)
+    if safe_rows:
+        best_f, best_p2 = max(safe_rows)
+        n_front = max((sum(1 for d in data if d["truth"] is True) for _, data in scan), default=0)
+        print("[推荐] 零逃逸约束下, MARK_HOUGH_P2=%d 正面召回最高 (%d/%d)。"
+              % (best_p2, best_f, n_front))
+        print("       注意: P2 越低越接近逃逸边缘, 建议在推荐值上留 1~2 的余量, 并结合反面裕度看。")
+    else:
+        print("[推荐] !! 没有一个 P2 能做到反面 0 逃逸 —— 单靠降 P2 救不回, 会连 NG 一起放过。")
+        print("       下一步: 收 MARK_R_RATIO_RANGE 上界 / 加严 shape_ok / 先把成像修好压低误检。")
+
+
 # ---------------------------------------------------------------- 入口
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="thrust_cage_flange_inspect 外挂调试报告 (不改原文件)")
@@ -794,9 +945,15 @@ def build_parser() -> argparse.ArgumentParser:
                          % ",".join("%.2f" % v for v in SWEEP_R_UPPER))
     ap.add_argument("--no-verify", action="store_true",
                     help="跳过复刻分割与模块记录值的等值断言(不建议)")
-    ap.add_argument("--truth", choices=("front", "back"), default=None,
-                    help="强制整批样本的真值, 用于按类分文件夹存放、文件名是相机时间戳的情况; "
-                         "默认由 guess_label() 从文件名推断")
+    ap.add_argument("--sweep-p2", dest="sweep_p2", nargs="?", const="", default=None,
+                    metavar="LIST",
+                    help="末尾追加 MARK_HOUGH_P2 扫描(每个 P2 重跑一次检测), 在反面 0 逃逸约束下挑正面召回最高的 P2。"
+                         "可给逗号分隔的值, 默认 %s"
+                         % ",".join(str(v) for v in SWEEP_P2))
+    ap.add_argument("--truth", choices=("front", "back", "folder"), default=None,
+                    help="真值来源。front/back=强制整批为一类; "
+                         "folder=按路径里的 OK/ 或 NG/ 子目录取真值(手动分类目录用, 推荐); "
+                         "默认由 guess_label() 从文件名推断(文件名不可靠时会错)。")
     ap.add_argument("--print", dest="show", action="store_true", help="同时打印主模块的逐帧表格")
     return ap
 
@@ -860,10 +1017,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("[INFO] 孔数模式 %s   圆度阈值 %.2f   最少压痕 %d   保真核对 %s"
           % ("全部孔" if args.holes <= 0 else "前 %d 孔" % args.holes,
              T.MARK_CIRCULARITY_MIN, T.MIN_VALID_MARKS, "关" if args.no_verify else "开"))
-    forced = {"front": True, "back": False}.get(args.truth)
-    if forced is not None:
-        print("[INFO] 真值强制为 %s (--truth %s), 不看文件名"
-              % ("正面" if forced else "反面", args.truth))
+    truth_fn = make_truth_fn(args.truth)
+    truth_src = {"folder": "按 OK/NG 子目录", "front": "强制正面", "back": "强制反面"}.get(
+        args.truth, "从文件名推断(guess_label)")
+    print("[INFO] 真值来源: %s" % truth_src)
+    if args.truth is None:
+        print("       提示: 若目录已按 OK/NG 手动分好, 用 --truth folder 更准(文件名常不可靠)。")
 
     n_ok = n_ng = n_bad = hit = miss = n_ver = n_sheet = n_border = 0
     stages: Dict[str, int] = {}
@@ -886,7 +1045,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # 再跑一遍 preprocess 拿主模块用的同一张 gray 与 clahe_only(确定性、无副作用);
             # inspect 只返回 (res, bgr), 而特征B 的增强圆度用的是 clahe_only, 必须自己取。
             _, gray, _, clahe_only, _ = T.preprocess(bgr)
-            truth = forced if forced is not None else T.guess_label(name)
+            truth = truth_fn(name)
             try:
                 rows, per_hole = analyse_image(gray, clahe_only, res, truth, not args.no_verify)
             except VerifyError as exc:
@@ -939,8 +1098,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("=" * 108)
         print("[半径扫描] %d 个上界 x %d 张, 每个上界重跑一次检测 (约 %.0f s)"
               % (len(uppers), n_img, len(uppers) * n_img * 0.27))
-        radius_table(radius_scan(src, args.limit, uppers, forced),
+        radius_table(radius_scan(src, args.limit, uppers, truth_fn),
                      os.path.join(root, "dbg_radius_%s.csv" % stamp))
+    if args.sweep_p2 is not None:
+        p2s = SWEEP_P2
+        if args.sweep_p2.strip():
+            try:
+                p2s = tuple(sorted((int(v) for v in args.sweep_p2.split(",") if v.strip()),
+                                   reverse=True))
+            except ValueError:
+                print("[FATAL] --sweep-p2 只接受逗号分隔的整数, 例: 14,12,10,8")
+                return 2
+            if not p2s:
+                print("[FATAL] --sweep-p2 的列表是空的")
+                return 2
+        n_img = min(len(src), args.limit) if args.limit else len(src)
+        print("=" * 108)
+        print("[P2 扫描] %d 个 P2 值 x %d 张, 每个值重跑一次检测 (约 %.0f s)"
+              % (len(p2s), n_img, len(p2s) * n_img * 0.27))
+        p2_table(p2_scan(src, args.limit, p2s, truth_fn),
+                 os.path.join(root, "dbg_p2_%s.csv" % stamp))
     return 0
 
 
