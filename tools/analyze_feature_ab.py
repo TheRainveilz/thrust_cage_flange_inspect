@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--holes", type=int, default=None,
                     help="参与统计的孔数；0=全部孔；默认使用主程序当前配置")
     ap.add_argument("--limit", type=int, default=0, help="最多处理多少张；0=全部")
+    ap.add_argument("--no-pitch-gate", action="store_true",
+                    help="关掉节圆前置闸(HOLE_PITCH_GATE=False)，用于复现闸前基线做对照；"
+                         "仅 pure 实现有该开关")
+    ap.add_argument("--feature-a-mode", default=None,
+                    choices=("contour", "hough", "contour_or_hough", "contour_and_hough"),
+                    help="覆盖 FEATURE_A_MODE，决定特征A用哪个分支；默认用模块当前值")
     return ap.parse_args()
 
 
@@ -173,10 +179,12 @@ def pct(num: int, den: int) -> str:
 
 def print_group(title: str, rows: List[ImageStat]) -> None:
     valid = [r for r in rows if r.error == ""]
-    images_with_holes = [r for r in valid if r.checked > 0]
-    a_images = sum(r.a_pass > 0 for r in images_with_holes)
-    b_images = sum(r.b_pass > 0 for r in images_with_holes)
-    pair_images = sum(r.pair_pass > 0 for r in images_with_holes)
+    # 图片级分母 = 成功分析的全部图片。定位失败/无受检孔的图必须计入分母:
+    # 它们不可能贡献任何通过孔, 剔掉会把 NG 侧的"100%"报成假象(623 张里 15 张定位失败)。
+    denom = len(valid)
+    a_images = sum(r.a_pass > 0 for r in valid)
+    b_images = sum(r.b_pass > 0 for r in valid)
+    pair_images = sum(r.pair_pass > 0 for r in valid)
     holes = sum(r.checked for r in valid)
     a_holes = sum(r.a_pass for r in valid)
     b_holes = sum(r.b_pass for r in valid)
@@ -185,9 +193,9 @@ def print_group(title: str, rows: List[ImageStat]) -> None:
 
     print(f"\n[{title}] 图片 {len(rows)} 张，成功分析 {len(valid)} 张")
     print("  图片级: A通过=%d/%d (%s) | B通过=%d/%d (%s) | A+B同时通过=%d/%d (%s)"
-          % (a_images, len(images_with_holes), pct(a_images, len(images_with_holes)),
-             b_images, len(images_with_holes), pct(b_images, len(images_with_holes)),
-             pair_images, len(images_with_holes), pct(pair_images, len(images_with_holes))))
+          % (a_images, denom, pct(a_images, denom),
+             b_images, denom, pct(b_images, denom),
+             pair_images, denom, pct(pair_images, denom)))
     print("  孔级  : A通过=%d/%d (%s) | B通过=%d/%d (%s) | A+B同时通过=%d/%d (%s)"
           % (a_holes, holes, pct(a_holes, holes),
              b_holes, holes, pct(b_holes, holes),
@@ -238,6 +246,24 @@ def main() -> int:
     print("[INFO] 实现:", args.impl)
     print("[INFO] 图片数:", len(paths))
     print("[INFO] HOLE_CHECK_COUNT:", T.HOLE_CHECK_COUNT)
+    # 节圆前置闸(见 inspector_pure.HOLE_PITCH_GATE): 默认开。关掉即复现闸前行为,
+    # 用来产出对照基线(如 ab_pure_holes0_<date>_pregate.csv)。
+    if hasattr(T, "HOLE_PITCH_GATE"):
+        if args.no_pitch_gate:
+            T.HOLE_PITCH_GATE = False
+        print("[INFO] 节圆前置闸:", T.HOLE_PITCH_GATE)
+    elif args.no_pitch_gate:
+        print("[WARN] %s 无 HOLE_PITCH_GATE, 忽略 --no-pitch-gate" % args.impl)
+    # 特征A 分支选择(见 inspector_pure.FEATURE_A_MODE)。实测(2026-09-21, 975 张):
+    # 判别力几乎全在 hough 分支(正面命中 96.4% vs 反面 47.0%), contour 分支正反面几乎一样
+    # (ring_count>=2: 56.7% vs 50.9%) —— "or" 把判别力弱的那个淹掉了。用本开关扫单分支。
+    if args.feature_a_mode is not None:
+        if hasattr(T, "FEATURE_A_MODE"):
+            T.FEATURE_A_MODE = args.feature_a_mode
+        else:
+            print("[WARN] %s 无 FEATURE_A_MODE, 忽略 --feature-a-mode" % args.impl)
+    if hasattr(T, "FEATURE_A_MODE"):
+        print("[INFO] FEATURE_A_MODE:", T.FEATURE_A_MODE)
     rows = []
     for index, path in enumerate(paths, 1):
         row = inspect_one(T, path)
