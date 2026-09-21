@@ -222,6 +222,21 @@ PART_LOGIC = "OR"  # 孔之间: "OR" = 任一孔满足即 OK (按需求 5)
 PART_MIN_PASS_HOLES = 1  # PART_LOGIC="OR" 下, 需要多少个受检孔同时(A&B)通过才判 OK(可回退)。
 #   1=现状(任一孔过即 OK); 提到 2 = 要求至少 2 个孔都过, 收紧单孔临界逃逸。PART_LOGIC="AND" 时此值忽略。回退: 设 1。
 
+# ---------- 8b. 前置闸: 孔必须落在节圆上 ----------
+# 2026-09-21 实测(tools/_diag_localize.py, 975 张 / 8598 受检孔, HOLE_CHECK_COUNT=0):
+#   孔心到 part_cx/cy 的距离与 pitch_r 比, 正面只有 76.6% 在节圆上(散度 mad=0.03 hole_r, 定位是准的);
+#   反面只有 23.1%(mad=1.04 hole_r —— 孔心根本不落在任何同心圆上, 是一堆伪圆);
+#   反面带压痕的 187 个孔里只有 15.0% 在节圆上; 160/623 张 NG 图一个合法孔都没有;
+#   11 个"差点凑够 MIN_VALID_MARKS"的反面孔 **11/11 都不在节圆上**。
+# 结论: 反面侧的 A/B 判定读的是错像素, 现在的"0 逃逸"是巧合而非裕度。本闸把"孔必须落在节圆上"
+# 变成参与判定的前提 —— 不在节圆上的孔直接 passed=False(但仍照常跑 A/B 以便 dbg 复算与后续修复)。
+# 方向永远偏 fail-safe: 一个合法孔都没有 -> 全孔否决 -> NG。实测代价: 正面召回 92.0% -> 81.8%
+# (过杀 +10%, 按"真实 NG 绝不可判 OK"铁律可接受), 反面逃逸 0/623 不变。回退: 设 False。
+HOLE_PITCH_GATE = True
+HOLE_PITCH_TOL_RATIO = PITCH_FIT_TOL_RATIO  # 内点容差, 与节圆拟合 fit_circle_robust 自身一致
+# 只在 pitch_fit 定位下生效: boundary_circle 的 pitch_r 是"外圆半径", 拿它当节圆判据是错的。
+HOLE_PITCH_GATE_METHODS = ("pitch_fit",)
+
 # ---------- 9. 调试 / 存图 ----------
 PRINT_DEBUG = True  # 打印每孔轮廓计数、有效压痕数、判定结果
 SAVE_NG_IMAGE = True  # NG 样本本地保存
@@ -1309,6 +1324,7 @@ class HoleResult:
     r: float
     contrast: float = 0.0
     in_frame: bool = True
+    on_pitch: bool = True  # 孔心是否落在节圆上(节圆拟合内点判据); False 时前置闸直接否决该孔
     raw_contour_count: int = 0  # ROI 内参与统计的原始轮廓数
     ring_count: int = 0  # 同心环数(特征A 主判据)
     ring_radii: List[float] = field(default_factory=list)
@@ -1430,6 +1446,19 @@ def locate_part(work: np.ndarray, cand: np.ndarray) -> Tuple[Optional[Tuple[floa
                 (_, _), rr = cv2.minEnclosingCircle(big_c)
                 return (m["m10"] / m["m00"], m["m01"] / m["m00"], float(rr)), "mask_centroid"
     return None, "none"
+
+
+def hole_on_pitch(hx: float, hy: float, part_cx: float, part_cy: float, pitch_r: float) -> bool:
+    """孔心是否落在节圆上 —— 判据与节圆拟合 fit_circle_robust 的内点容差完全一致。
+
+    落在节圆上是"这个 ROI 真的是一个孔位"的最低前提: 不在节圆上 -> 拐角窗口切在别的
+    东西上(划痕/纹理/内外圈边界), 特征A/B 读的都是错像素。pitch_r<=0 视为无法验证 -> False
+    (fail-safe: 无法验证就不放行)。
+    """
+    if pitch_r <= 0.0:
+        return False
+    tol = max(HOLE_PITCH_TOL_RATIO * pitch_r, PITCH_FIT_TOL_MIN_PX)
+    return abs(float(np.hypot(hx - part_cx, hy - part_cy)) - pitch_r) <= tol
 
 
 # ------------------------------------------------------------------ 孔心精定位
@@ -1886,14 +1915,17 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
     res.hole_r = r_med
     holes: List[HoleResult] = []
     h_img, w_img = gray.shape[:2]
+    gate_on = HOLE_PITCH_GATE and method.split("(")[0] in HOLE_PITCH_GATE_METHODS
     for i, (hx, hy, hr, contrast) in enumerate(refined):
         if abs(hr - r_med) / max(r_med, 1e-6) > HOLE_R_DEV_MAX:
             continue
         r_use = r_med if USE_GLOBAL_HOLE_RADIUS else hr
         margin = RING_ROI_RATIO * r_use
         in_frame = (margin <= hx < w_img - margin) and (margin <= hy < h_img - margin)
-        holes.append(HoleResult(index=i, cx=hx, cy=hy, r=r_use,
-                                contrast=contrast, in_frame=in_frame))
+        holes.append(HoleResult(index=i, cx=hx, cy=hy, r=r_use, contrast=contrast,
+                                in_frame=in_frame,
+                                on_pitch=(not gate_on) or hole_on_pitch(
+                                    hx, hy, res.part_cx, res.part_cy, res.pitch_r)))
     if len(holes) < MIN_HOLE_COUNT:
         res.verdict = NG_HOLE_NOT_FOUND
         res.reason = "孔径一致性筛选后不足: %d < %d" % (len(holes), MIN_HOLE_COUNT)
@@ -1904,7 +1936,9 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
     for hole in holes:
         hole.corners_in_frame = count_corners_in_frame(
             gray.shape, hole.cx, hole.cy, hole.r, res.part_cx, res.part_cy)
-    holes.sort(key=lambda q: (not q.in_frame, -q.corners_in_frame, -q.contrast))
+    # 排序: 框内优先 -> 在节圆上优先 -> 拐角完整优先 -> 对比度高优先。
+    # 节圆优先级只在 HOLE_CHECK_COUNT>0(限量取样)时改变行为; 生产配置 0=全部孔, 不受影响。
+    holes.sort(key=lambda q: (not q.in_frame, not q.on_pitch, -q.corners_in_frame, -q.contrast))
     n_check = len(holes) if HOLE_CHECK_COUNT <= 0 else min(HOLE_CHECK_COUNT, len(holes))
     if timing:
         res.timings_ms["hole_select"] = (time.perf_counter() - selection_start) * 1000.0
@@ -1950,6 +1984,10 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
         hole.feature_b = marks >= MIN_VALID_MARKS
         hole.passed = (hole.feature_a and hole.feature_b) if HOLE_LOGIC == "AND" \
             else (hole.feature_a or hole.feature_b)
+        if not hole.on_pitch:
+            # 前置闸: 孔心不在节圆上 -> 这个 ROI 不是孔位, A/B 读的是错像素, 一票否决。
+            # A/B 照常算完(便于 dbg 复算与后续定位修复), 只是不允许它把工件判成 OK。
+            hole.passed = False
         if timing:
             res.timing_details["hole_%d" % hole.index] = {
                 "feature_a_ms": feature_a_ms,
@@ -1970,7 +2008,13 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
         res.verdict, res.reason = OK_PASS, "存在翻边外圈 + 冲压小圆压痕(正面)"
     else:
         res.verdict = NG_NO_FEATURE
-        res.reason = "所有受检孔均无有效翻边/压痕特征(反面或漏冲)"
+        n_gated = sum(1 for q in checked_holes if not q.on_pitch)
+        if n_gated:
+            res.reason = ("所有受检孔均无有效翻边/压痕特征(反面或漏冲); "
+                          "另有 %d/%d 个受检孔不在节圆上, 已被前置闸直接否决"
+                          % (n_gated, len(checked_holes)))
+        else:
+            res.reason = "所有受检孔均无有效翻边/压痕特征(反面或漏冲)"
     stage_done("final_decision")
     return finish()
 
@@ -1986,11 +2030,12 @@ def print_result(res: InspectResult) -> None:
              "特征A", "有效压痕", "特征B", "单孔"))
     for hole in res.holes[:len(res.checked)]:
         flange = "-" if hole.flange_hough_r is None else "%.2f" % hole.flange_hough_r
-        print("  #%-3d (%7.1f,%7.1f) %-7d %-6d %-24s %-9s %-6s %d/%-5d %-6s %s"
+        print("  #%-3d (%7.1f,%7.1f) %-7d %-6d %-24s %-9s %-6s %d/%-5d %-6s %s%s"
               % (hole.index, hole.cx, hole.cy, hole.raw_contour_count, hole.ring_count,
                  str(hole.ring_radii), flange, "PASS" if hole.feature_a else "FAIL",
                  hole.valid_marks, hole.corners_in_frame,
-                 "PASS" if hole.feature_b else "FAIL", "OK" if hole.passed else "NG"))
+                 "PASS" if hole.feature_b else "FAIL", "OK" if hole.passed else "NG",
+                 "" if hole.on_pitch else "  <- 不在节圆上, 前置闸否决"))
         detail = "  ".join("%+6.1f°:%s(circ=%.2f,r=%.2f)"
                            % (d["angle"], "Y" if d["ok"] else ("-" if d["in_frame"] else "x"),
                               d["circ"], d["r"]) for d in hole.corner_hits)
