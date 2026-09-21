@@ -498,7 +498,8 @@ CSV_HEADER = ("image", "truth", "verdict", "reason", "elapsed_ms", "locate", "pi
               "corner_angle", "corner_cx", "corner_cy", "in_frame", "stage", "hough_n",
               "mark_r_ratio", "circ", "ok",
               "sweep_q", "sweep_pol", "sweep_pass", "sweep_combo", "circ_curve",
-              "hole_valid_marks", "corners_in_frame", "feature_b", "hole_passed")
+              "hole_valid_marks", "corners_in_frame", "feature_b", "hole_passed",
+              "hole_on_pitch")
 
 
 def analyse_image(gray: np.ndarray, clahe_only: Optional[np.ndarray], res,
@@ -519,7 +520,8 @@ def analyse_image(gray: np.ndarray, clahe_only: Optional[np.ndarray], res,
                 hole.ring_count, "|".join("%.3f" % v for v in hole.ring_radii),
                 "" if hole.flange_hough_r is None else round(hole.flange_hough_r, 3),
                 int(hole.feature_a)]
-        tail = [hole.valid_marks, hole.corners_in_frame, int(hole.feature_b), int(hole.passed)]
+        tail = [hole.valid_marks, hole.corners_in_frame, int(hole.feature_b), int(hole.passed),
+                int(hole.on_pitch)]
         anas: List[dict] = []
         for rec in hole.corner_hits:
             check_corner_keys(rec)
@@ -584,6 +586,10 @@ def collect_sweep(res, holes, truth: Optional[bool]) -> dict:
     center_offset/radius_ratio/circ_enhanced/dynamic_roi 一起记下来, 才能在网格里复算真实判定。
     近似: 主模块选候选圆时排序键含 accepted(用当前 MARK_CIRCULARITY_MIN), 换 tc 理论上可能改选
     另一个候选; 这里只记赢的那个候选, 属二阶近似(与 --sweep-radius 同量级), 逐帧 CSV 不受影响。
+
+    另记每孔的 on_pitch: 主模块里 HOLE_PITCH_GATE 打开时, 不在节圆上的孔被一票否决
+    (hole.passed=False), 补压痕也救不回。漏记这一条会让网格高估正面、并漏报反面逃逸
+    —— 见 verdict_at / margin_at 里的对应处理, 以及 sweep_table 末尾的自检。
     """
     def corner_info(rec: dict) -> dict:
         return {"circ_raw": float(rec.get("circ_raw", rec.get("circ", 0.0))),
@@ -593,6 +599,8 @@ def collect_sweep(res, holes, truth: Optional[bool]) -> dict:
                 "dyn": bool(rec.get("dynamic_roi", False))}
     return {"truth": truth, "is_ok": res.is_ok, "verdict": res.verdict,
             "holes": [{"feature_a": bool(hole.feature_a),
+                       # 关闸时主模块把 on_pitch 全置 True, 所以读它即可, 不必再判 HOLE_PITCH_GATE。
+                       "on_pitch": bool(getattr(hole, "on_pitch", True)),
                        "corners": [corner_info(rec) for rec in hole.corner_hits if rec["in_frame"]]}
                       for hole in holes]}
 
@@ -621,8 +629,16 @@ def verdict_at(item: dict, tc: float, tm: int) -> bool:
     flags = []
     for h in item["holes"]:
         fb = _hole_marks(h, tc) >= tm
-        flags.append((h["feature_a"] and fb) if T.HOLE_LOGIC == "AND" else (h["feature_a"] or fb))
-    return any(flags) if T.PART_LOGIC == "OR" else all(flags)
+        ok = (h["feature_a"] and fb) if T.HOLE_LOGIC == "AND" else (h["feature_a"] or fb)
+        # 节圆闸: 不在节圆上的孔在主模块里被一票否决(hole.passed=False), 补压痕也救不回。
+        if not h.get("on_pitch", True):
+            ok = False
+        flags.append(ok)
+    # 与主模块一致: OR 逻辑下需要 >= PART_MIN_PASS_HOLES 个孔通过(不是任一孔),
+    # AND 逻辑下要求全部孔通过。PART_MIN_PASS_HOLES 是加厚裕度的结构性杠杆, 必须在此建模。
+    if T.PART_LOGIC == "OR":
+        return sum(bool(f) for f in flags) >= getattr(T, "PART_MIN_PASS_HOLES", 1)
+    return all(flags)
 
 
 def margin_at(item: dict, tc: float, tm: int) -> Optional[int]:
@@ -637,15 +653,24 @@ def margin_at(item: dict, tc: float, tm: int) -> Optional[int]:
     if not holes:
         return None                                           # 早退 NG, 与压痕数无关
     if T.HOLE_LOGIC == "AND":
-        usable = [h for h in holes if h["feature_a"]]          # 特征A 否掉的孔, 补压痕也救不回
+        # 特征A 否掉的孔、以及被节圆闸否决的孔, 补压痕都救不回 -> 都不算 usable
+        usable = [h for h in holes if h["feature_a"] and h.get("on_pitch", True)]
         if not usable or (T.PART_LOGIC == "AND" and len(usable) < len(holes)):
             return None
     else:
-        if any(h["feature_a"] for h in holes):                 # OR: 特征A 单独定调
+        if any(h["feature_a"] and h.get("on_pitch", True) for h in holes):   # OR: 特征A 单独定调
             return None
-        usable = holes
+        usable = [h for h in holes if h.get("on_pitch", True)]
     counts = [_hole_marks(h, tc) for h in usable]
-    key = max(counts) if T.PART_LOGIC == "OR" else min(counts)  # OR 看最强孔, AND 看最弱孔
+    if T.PART_LOGIC == "OR":
+        # 需要 k=PART_MIN_PASS_HOLES 个孔达到 tm。决定性的是"第 k 强的孔": 它跌破 tm 就少一个
+        # 通过孔翻 NG; 判 NG 时把它补到 tm 就多一个通过孔翻 OK。k=1 时退化为看最强孔(旧行为)。
+        k = max(1, getattr(T, "PART_MIN_PASS_HOLES", 1))
+        if k > len(counts):
+            return None                                        # 孔数不够 k 个, 加减压痕都翻不动
+        key = sorted(counts, reverse=True)[k - 1]              # 第 k 强孔的压痕数
+    else:
+        key = min(counts)                                      # AND: 看最弱孔
     return (key - tm) if verdict_at(item, tc, tm) else (tm - key)
 
 
@@ -700,6 +725,21 @@ def sweep_table(data: List[dict]) -> None:
             print("   %.2f   |" % tc + "".join("  %3d/%-3d        "
                                                % (sum(1 for d in unk if verdict_at(d, tc, tm)), len(unk))
                                                for tm in SWEEP_TM))
+    # 自检: 当前参数下的网格单元必须与主循环实跑计数一致; 不一致 = 解析模型与流水线脱钩。
+    # 这不是理论风险: 2026-09-21 就出过 —— 模型漏了节圆闸 on_pitch, 报 341/352 正面、622/623
+    # 反面(1 张逃逸), 而同一次运行的实跑是 290/352、623/623。漏检的逃逸最危险, 所以必须硬报。
+    tc0, tm0 = T.MARK_CIRCULARITY_MIN, T.MIN_VALID_MARKS
+    mf = sum(1 for d in front if verdict_at(d, tc0, tm0))
+    mb = sum(1 for d in back if not verdict_at(d, tc0, tm0))
+    af = sum(1 for d in front if d["is_ok"])
+    ab_ = sum(1 for d in back if not d["is_ok"])
+    agree = (mf == af and mb == ab_)
+    print("  [自检] 当前参数 (circmin=%.2f, tm=%d) 网格单元 vs 实跑: "
+          "正面 %d/%d vs %d/%d, 反面 %d/%d vs %d/%d   %s"
+          % (tc0, tm0, mf, len(front), af, len(front), mb, len(back), ab_, len(back),
+             "一致 ✓" if agree else "*** 脱钩! 网格不可信, 先修 collect_sweep ***"))
+    if not agree:
+        print("         (网格高估正面或漏报逃逸 = 解析模型少建了某道闸; 别采信下面的[推荐])")
     if back:
         margin_grid(front, back)
     recommend(front, back)
