@@ -1,0 +1,664 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>压痕检测能力评估</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700;900&display=swap">
+<style>
+  :root{
+    --ground:#eef1f4;
+    --panel:#ffffff;
+    --panel-2:#f6f8fa;
+    --ink:#1a2028;
+    --ink-2:#4a5563;
+    --ink-3:#7a8794;
+    --line:#d6dde4;
+    --line-strong:#b9c3cc;
+    --accent:#0e8ea3;        /* 测量青 · 卡尺读数 */
+    --accent-soft:#d3ebef;
+    --safe:#12855a;          /* 信号绿 · 零逃逸/安全 */
+    --safe-soft:#d3ede0;
+    --warn:#b5731a;          /* 琥珀 · 过杀(可接受) */
+    --warn-soft:#f2e4cf;
+    --danger:#c0392b;        /* 红 · 逃逸(禁止) */
+    --danger-soft:#f3d9d5;
+    --shadow:0 1px 2px rgba(26,32,40,.06),0 8px 24px rgba(26,32,40,.06);
+    --radius:10px;
+  }
+  :root:not([data-theme="light"]){}
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#0d1116;
+      --panel:#151b22;
+      --panel-2:#1b232c;
+      --ink:#e7edf3;
+      --ink-2:#a9b6c2;
+      --ink-3:#71808d;
+      --line:#28323d;
+      --line-strong:#3a4754;
+      --accent:#3bc0d6;
+      --accent-soft:#123842;
+      --safe:#3fcf8e;
+      --safe-soft:#123528;
+      --warn:#e0a44a;
+      --warn-soft:#3a2c14;
+      --danger:#f0685a;
+      --danger-soft:#3a1c18;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0d1116;
+    --panel:#151b22;
+    --panel-2:#1b232c;
+    --ink:#e7edf3;
+    --ink-2:#a9b6c2;
+    --ink-3:#71808d;
+    --line:#28323d;
+    --line-strong:#3a4754;
+    --accent:#3bc0d6;
+    --accent-soft:#123842;
+    --safe:#3fcf8e;
+    --safe-soft:#123528;
+    --warn:#e0a44a;
+    --warn-soft:#3a2c14;
+    --danger:#f0685a;
+    --danger-soft:#3a1c18;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--ground);
+    color:var(--ink);
+    font-family:"Noto Sans SC","Segoe UI",system-ui,sans-serif;
+    line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{
+    max-width:940px;
+    margin:0 auto;
+    padding-inline:22px;
+    padding-block:48px 72px;
+  }
+  .mono{font-family:"IBM Plex Mono",ui-monospace,"SFMono-Regular",monospace;font-variant-numeric:tabular-nums}
+
+  /* ---- report header ---- */
+  .rpt-head{
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    background:var(--panel);
+    box-shadow:var(--shadow);
+    overflow:hidden;
+  }
+  .rpt-topbar{
+    display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+    padding:14px 22px;
+    background:var(--panel-2);
+    border-bottom:1px solid var(--line);
+  }
+  .rpt-topbar .tag{
+    font-family:"IBM Plex Mono",monospace;
+    font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3);
+  }
+  .rpt-topbar .status{
+    display:inline-flex;align-items:center;gap:8px;
+    font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:600;letter-spacing:.04em;
+    color:var(--safe);
+    padding:5px 12px;border:1px solid var(--safe);border-radius:999px;background:var(--safe-soft);
+  }
+  .rpt-topbar .status .dot{width:8px;height:8px;border-radius:50%;background:var(--safe)}
+  .rpt-body{padding:30px 22px 26px}
+  h1{
+    font-size:clamp(26px,5vw,40px);font-weight:900;line-height:1.15;margin:0 0 10px;
+    letter-spacing:-.01em;text-wrap:balance;
+  }
+  .subtitle{font-size:16px;color:var(--ink-2);margin:0 0 22px;max-width:60ch;text-wrap:balance}
+  .specrow{
+    display:flex;flex-wrap:wrap;gap:0;
+    border:1px solid var(--line);border-radius:8px;overflow:hidden;
+  }
+  .spec{
+    flex:1 1 140px;padding:12px 16px;border-right:1px solid var(--line);background:var(--panel);
+  }
+  .spec:last-child{border-right:none}
+  .spec .k{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);margin-bottom:3px}
+  .spec .v{font-family:"IBM Plex Mono",monospace;font-size:17px;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+
+  /* ---- section ---- */
+  section{margin-top:44px}
+  .eyebrow{
+    display:flex;align-items:center;gap:10px;
+    font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--accent);margin-bottom:14px;
+  }
+  .eyebrow::before{content:"";width:22px;height:2px;background:var(--accent);border-radius:2px}
+  h2{font-size:22px;font-weight:700;margin:0 0 8px;letter-spacing:-.01em;text-wrap:balance}
+  .lead{color:var(--ink-2);margin:0 0 20px;max-width:66ch}
+
+  /* ---- verdict tiles ---- */
+  .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .tile{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:20px 18px;box-shadow:var(--shadow);position:relative;
+  }
+  .tile .cap{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px}
+  .tile .big{font-family:"IBM Plex Mono",monospace;font-size:clamp(30px,7vw,42px);font-weight:600;line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .tile .unit{font-size:15px;font-weight:500;color:var(--ink-3)}
+  .tile .note{font-size:13px;color:var(--ink-2);margin-top:10px;line-height:1.5}
+  .tile.safe{border-top:3px solid var(--safe)}
+  .tile.safe .big{color:var(--safe)}
+  .tile.accent{border-top:3px solid var(--accent)}
+  .tile.accent .big{color:var(--accent)}
+  .tile.warn{border-top:3px solid var(--warn)}
+  .tile.warn .big{color:var(--warn)}
+
+  /* ---- callout ---- */
+  .callout{
+    display:flex;gap:16px;align-items:flex-start;
+    background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:8px;padding:18px 20px;box-shadow:var(--shadow);
+  }
+  .callout .mark{font-family:"IBM Plex Mono",monospace;font-weight:600;color:var(--accent);font-size:13px;white-space:nowrap;padding-top:2px}
+  .callout p{margin:0;color:var(--ink-2)}
+  .callout strong{color:var(--ink);font-weight:700}
+
+  /* ---- table ---- */
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);background:var(--panel)}
+  table{width:100%;border-collapse:collapse;min-width:460px}
+  thead th{
+    font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--ink-3);text-align:right;padding:13px 18px;background:var(--panel-2);border-bottom:1px solid var(--line-strong);font-weight:500;
+  }
+  thead th:first-child{text-align:left}
+  tbody td{padding:12px 18px;text-align:right;border-bottom:1px solid var(--line);font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;font-size:15px}
+  tbody td:first-child{text-align:left;font-weight:500}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr.best td{background:var(--safe-soft)}
+  tbody tr.best td:first-child{color:var(--safe);font-weight:700}
+  .pill{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px}
+  .pill.zero{color:var(--safe);background:var(--safe-soft)}
+  .pill.warnp{color:var(--warn);background:var(--warn-soft)}
+  .pill.esc{color:var(--danger);background:var(--danger-soft)}
+  .cap-note{font-size:12.5px;color:var(--ink-3);margin-top:10px;padding-left:2px}
+
+  /* ---- chart ---- */
+  .chart-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px 18px 14px}
+  .chart-card svg{display:block;width:100%;height:auto}
+  .legend{display:flex;gap:20px;flex-wrap:wrap;margin-top:6px;padding-left:6px}
+  .legend span{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-2);font-family:"IBM Plex Mono",monospace}
+  .legend i{width:14px;height:3px;border-radius:2px;display:inline-block}
+
+  /* ---- dead ends ---- */
+  .deadgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .dead{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px 18px;box-shadow:var(--shadow)}
+  .dead .h{display:flex;align-items:center;gap:9px;font-weight:700;margin-bottom:6px;font-size:15px}
+  .dead .x{font-family:"IBM Plex Mono",monospace;color:var(--danger);font-weight:600;font-size:15px}
+  .dead p{margin:0;font-size:13.5px;color:var(--ink-2);line-height:1.55}
+  .dead .res{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--danger);margin-top:8px;font-weight:500}
+
+  /* ---- physics ---- */
+  .phys{display:grid;grid-template-columns:1.15fr 1fr;gap:20px;align-items:stretch}
+  .phys-diagram{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px}
+  .phys-diagram svg{display:block;width:100%;height:auto}
+  .phys-text{display:flex;flex-direction:column;gap:14px}
+  .phys-text .row{display:flex;gap:12px;align-items:flex-start}
+  .phys-text .n{font-family:"IBM Plex Mono",monospace;font-weight:600;color:var(--accent);font-size:13px;flex:none;width:26px}
+  .phys-text .row p{margin:0;font-size:14px;color:var(--ink-2)}
+  .phys-text .row strong{color:var(--ink)}
+
+  /* ---- conclusion ---- */
+  .concl{background:var(--panel);border:1px solid var(--line-strong);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+  .concl .band{background:var(--ink);color:var(--panel);padding:16px 24px;font-weight:700;font-size:17px;display:flex;align-items:center;gap:12px}
+  :root[data-theme="dark"] .concl .band,:root:not([data-theme="light"]) .concl .band{background:var(--accent);color:#04222a}
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .concl .band{background:var(--accent);color:#04222a}}
+  .concl .body{padding:22px 24px}
+  .concl ol{margin:0;padding-left:22px;display:flex;flex-direction:column;gap:14px}
+  .concl li{color:var(--ink-2);padding-left:4px}
+  .concl li strong{color:var(--ink)}
+  .concl .rec{margin-top:20px;padding:16px 18px;background:var(--accent-soft);border-radius:8px;border:1px solid var(--accent);color:var(--ink)}
+  .concl .rec b{color:var(--accent)}
+
+  footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--line);color:var(--ink-3);font-size:12px;font-family:"IBM Plex Mono",monospace;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+
+  .themetoggle{
+    position:fixed;top:calc(env(safe-area-inset-top,0px) + 14px);right:16px;z-index:10;
+    font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.08em;
+    background:var(--panel);color:var(--ink-2);border:1px solid var(--line);border-radius:999px;
+    padding:7px 13px;cursor:pointer;box-shadow:var(--shadow);
+  }
+  .themetoggle:hover{border-color:var(--accent);color:var(--accent)}
+  .themetoggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  @media (max-width:680px){
+    .tiles{grid-template-columns:1fr}
+    .phys{grid-template-columns:1fr}
+    .deadgrid{grid-template-columns:1fr}
+  }
+  @media (prefers-reduced-motion:no-preference){
+    .tile,.dead,.tbl-wrap,.chart-card,.callout{animation:rise .5s cubic-bezier(.2,.7,.3,1) both}
+  }
+  @keyframes rise{from{opacity:.001;transform:translateY(8px)}to{opacity:1;transform:none}}
+</style>
+
+<button class="themetoggle" id="themeBtn" type="button">◐ 主题</button>
+
+<div class="wrap">
+
+  <header class="rpt-head">
+    <div class="rpt-topbar">
+      <span class="tag">推力保持架翻边止口 · 视觉检测</span>
+      <span class="status"><span class="dot"></span>零逃逸 已达成</span>
+    </div>
+    <div class="rpt-body">
+      <h1>压痕检测能力评估</h1>
+      <p class="subtitle">基于 975 张已分类样本的系统扫描：安全性（两道独立的闸）、召回上限，以及为什么再进一步取决于光。</p>
+      <div class="specrow">
+        <div class="spec"><div class="k">样本总数</div><div class="v">975 帧</div></div>
+        <div class="spec"><div class="k">正面 / OK</div><div class="v">352</div></div>
+        <div class="spec"><div class="k">反面 / NG</div><div class="v">623</div></div>
+        <div class="spec"><div class="k">真值来源</div><div class="v">按目录人工分类</div></div>
+        <div class="spec"><div class="k">评估日期</div><div class="v">2026-09-22</div></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- 结论仪表 -->
+  <section aria-label="核心结论">
+    <div class="eyebrow">核心结论 · Bottom line</div>
+    <div class="tiles">
+      <div class="tile safe">
+        <div class="cap">反面逃逸</div>
+        <div class="big">0<span class="unit"> / 623</span></div>
+        <div class="note">623 张反面件无一被误判为 OK。真实 NG 判 OK（逃逸）为零 —— 安全铁律满足。</div>
+      </div>
+      <div class="tile accent">
+        <div class="cap">正面召回（投产配置）</div>
+        <div class="big">90.3<span class="unit">%</span></div>
+        <div class="note">318 / 352 张正面件正确判 OK。检出能力本为 96.6%（340 张），件级广度闸为加厚安全裕度让出 6.3 个点；过杀由振动盘回流吸收（误踢的好件转一圈重拍即回）。</div>
+      </div>
+      <div class="tile warn">
+        <div class="cap">逃逸所需侥幸</div>
+        <div class="big">4<span class="unit"> 次独立</span></div>
+        <div class="note">一张反面件要逃逸，需 <strong>4 个不同的孔各自都侥幸冒出假压痕</strong>（件级广度闸 K=4）。领圈闸之前只需 1 次侥幸。裕度从 1 抬到 4。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 安全性机理 -->
+  <section aria-label="安全性来源">
+    <div class="eyebrow">安全性从何而来</div>
+    <h2>两道独立的闸，各自都能否决反面</h2>
+    <p class="lead">一件判 OK，必须同一个孔<strong>既</strong>通过翻边（特征 A）<strong>又</strong>通过压痕圆度（特征 B）。曾一度发现特征 A 在反面几乎不设防（47% 的孔照样放行），零逃逸一度只剩特征 B 一道闸独撑。<strong>「领圈深度闸」把特征 A 补回成了真闸</strong>：反面孔级通过率从 47.0% 压到 3.5%，两道闸重新各自独立成立。</p>
+    <div class="callout" style="margin-bottom:18px;border-left-color:var(--safe)">
+      <span class="mono">领圈闸怎么补回 A</span>
+      <p>特征 A 原本只查“孔周围有没有同心环状边缘”—— 而反面<strong>直接冲穿的薄锐边</strong>同样是一圈环，必然放行。但正面翻边是<strong>有成形深度</strong>的锥唇，每孔周围一圈<strong>又黑又粗的深色领圈</strong>；反面平孔只有一条细边线、没有领圈。量领圈带 <span class="mono">[1.00,1.35]r</span> 里“明显暗于外侧亮环”的像素占比（darkfrac），正面孔中位 0.270、反面孔中位 0.003 —— <strong>几乎不重叠</strong>。给 A 加一条“领圈够黑（darkfrac ≥ 0.12）”的 AND 要求：结构上只增过杀、绝不增逃逸，反面 A 孔级 47.0% → <strong>3.5%</strong>，正面图片级召回 <strong>一张不掉</strong>。</p>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>623 张反面件 · 逐孔漏斗</th><th>孔数</th><th>占上一步</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>定位到的受检孔</td><td>5288</td><td>—</td><td>定位阶段</td></tr>
+          <tr><td>└ 通过特征 A（同心环 + 领圈够黑）</td><td>184</td><td>3.5%</td><td>领圈闸后，A 独自否掉 96.5%</td></tr>
+          <tr class="best"><td>　　└ 再通过特征 B（压痕成对）</td><td>0</td><td>0%</td><td><span class="pill zero">pair_pass = 0 · 两道闸都归零</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cap-note">按图统计：623 张反面件里，特征 A 图片级通过从 86.7% 压到 <strong>15.7%</strong>；「已有一个在节圆上、过了 A 的孔、只差压痕」的图从 265 张降到 <strong>50 张（8.0%）</strong>。反面压痕图片级通过率本就只有 1.9%。<strong>现在 A 和 B 是两道各自独立的闸，都能单独否决反面</strong> —— 但两道闸的上限都压在同一个成像死结上，这正是下一节的物理成因。</p>
+
+    <div class="callout" style="margin-top:18px;border-left-color:var(--safe)">
+      <span class="mono">件级广度闸 · 把 B 对单孔侥幸硬化</span>
+      <p>再往上叠了一道<strong>件级</strong>闸：判 OK 除「有一个孔过 A&amp;B」外，还要求<strong>整件至少 4 个孔各自见到压痕</strong>（<span class="mono">PART_MIN_MARKED_HOLES=4</span>）。依据：反面是冲穿件、从没被冲压过，全量实测正面 OK 的「有压痕的孔数」中位 7（p10=4），而反面 p90=0、上限仅 3 —— <strong>K=4 严格高过全部 623 张 NG 的观测上限</strong>。它不是新的物理维度（仍是压痕证据的整件汇总），而是把逃逸门槛从「1 个孔侥幸凑 2 痕」抬到「4 个不同孔各自冒压痕」，独立小概率相乘。方向 fail-safe（只收紧、绝不增逃逸）。代价：正面 340→318（90.3%），在振动盘回流下被吸收 —— 误踢的好件转一圈重拍即回；而 NG 件反复回流、每趟都是一次逃逸抽奖，正需要每趟裕度尽量厚。</p>
+    </div>
+  </section>
+
+  <!-- 孔数扫描 -->
+  <section aria-label="受检孔数与召回">
+    <div class="eyebrow">受检孔数扫描</div>
+    <h2>孔查得越多，召回越高，逃逸始终为零</h2>
+    <p class="lead">件级广度闸要求整件≥4 个孔见到压痕，所以受检孔数<strong>必须取满</strong>：查 3 孔时凑不齐 4 个，召回直接归零；查得越多正面越容易满足，对反面无害（逃逸全程为零）。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>受检孔数</th><th>正面召回</th><th>召回率</th><th>反面逃逸</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>3 孔</td><td>0 / 352</td><td>0.0%</td><td><span class="pill zero">0 / 623</span></td></tr>
+          <tr><td>4 孔</td><td>151 / 352</td><td>42.9%</td><td><span class="pill zero">0 / 623</span></td></tr>
+          <tr><td>5 孔</td><td>219 / 352</td><td>62.2%</td><td><span class="pill zero">0 / 623</span></td></tr>
+          <tr><td>6 孔</td><td>266 / 352</td><td>75.6%</td><td><span class="pill zero">0 / 623</span></td></tr>
+          <tr class="best"><td>全部孔（现状）</td><td>318 / 352</td><td>90.3%</td><td><span class="pill zero">0 / 623</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cap-note">判据：FEATURE_A_MODE=hough，领圈闸 COLLAR_DARKFRAC_MIN=0.12，MIN_VALID_MARKS=2，件级广度闸 PART_MIN_MARKED_HOLES=4，软接受开，PART_MIN_PASS_HOLES=1。绿底行为投产（现状）配置，全部孔召回 90.3%、逃逸 0。</p>
+
+    <div class="chart-card" style="margin-top:18px">
+      <svg viewBox="0 0 680 350" role="img" aria-label="召回率随受检孔数上升，反面逃逸全程为零">
+        <!-- y grid + ticks -->
+        <g font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--ink-3)">
+          <line x1="60" y1="30"  x2="640" y2="30"  stroke="var(--line)"/>
+          <line x1="60" y1="95"  x2="640" y2="95"  stroke="var(--line)"/>
+          <line x1="60" y1="160" x2="640" y2="160" stroke="var(--line)"/>
+          <line x1="60" y1="225" x2="640" y2="225" stroke="var(--line)"/>
+          <line x1="60" y1="290" x2="640" y2="290" stroke="var(--line-strong)"/>
+          <text x="52" y="34"  text-anchor="end">100</text>
+          <text x="52" y="99"  text-anchor="end">75</text>
+          <text x="52" y="164" text-anchor="end">50</text>
+          <text x="52" y="229" text-anchor="end">25</text>
+          <text x="52" y="294" text-anchor="end">0</text>
+        </g>
+        <!-- bars: baseline 290, 100%->30, scale 260px per 100% -->
+        <g>
+          <rect x="86"  y="289.0" width="64" height="1.0"   rx="3" fill="var(--accent)" opacity=".55"/>
+          <rect x="202" y="178.5" width="64" height="111.5" rx="3" fill="var(--accent)" opacity=".62"/>
+          <rect x="318" y="128.3" width="64" height="161.7" rx="3" fill="var(--accent)" opacity=".70"/>
+          <rect x="434" y="93.4"  width="64" height="196.6" rx="3" fill="var(--accent)" opacity=".78"/>
+          <rect x="550" y="55.2"  width="64" height="234.8" rx="3" fill="var(--safe)"/>
+        </g>
+        <!-- value labels -->
+        <g font-family="IBM Plex Mono, monospace" font-size="14" font-weight="600" text-anchor="middle" fill="var(--ink)">
+          <text x="118" y="282">0.0</text>
+          <text x="234" y="171">42.9</text>
+          <text x="350" y="120">62.2</text>
+          <text x="466" y="85">75.6</text>
+          <text x="582" y="47" fill="var(--safe)">90.3</text>
+        </g>
+        <!-- x labels -->
+        <g font-family="IBM Plex Mono, monospace" font-size="12.5" text-anchor="middle" fill="var(--ink-2)">
+          <text x="118" y="312">3 孔</text>
+          <text x="234" y="312">4 孔</text>
+          <text x="350" y="312">5 孔</text>
+          <text x="466" y="312">6 孔</text>
+          <text x="582" y="312">全部</text>
+        </g>
+        <!-- zero-escape floor line -->
+        <line x1="60" y1="290" x2="640" y2="290" stroke="var(--safe)" stroke-width="2.5"/>
+        <text x="640" y="333" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="12.5" font-weight="600" fill="var(--safe)">反面逃逸 0 / 623 · 全程</text>
+        <text x="60" y="333" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--ink-3)">正面召回率 (%)</text>
+      </svg>
+      <div class="legend">
+        <span><i style="background:var(--accent);opacity:.7"></i>正面召回率</span>
+        <span><i style="background:var(--safe)"></i>零逃逸基线（安全铁律）</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 压痕数门槛扫描 -->
+  <section aria-label="压痕数门槛扫描">
+    <div class="eyebrow">压痕数门槛扫描</div>
+    <h2>门槛调严只会误杀真件，挡不住反面</h2>
+    <p class="lead">一个孔 4 个拐角，<span class="mono">MIN_VALID_MARKS</span> 要求其中几个有压痕才算本孔通过。把它从 2 调到 3 或 4，直觉上更安全 —— 全量 975 帧说：反面一点没变，正面塌了。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>压痕数门槛</th><th>正面判 OK</th><th>召回率</th><th>反面判 NG</th><th>反面裕度</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1 个（调松）</td><td>348 / 352</td><td>98.9%</td><td><span class="pill esc">613 / 623</span></td><td>已有逃逸</td></tr>
+          <tr class="best"><td>2 个（选定基准）</td><td>340 / 352</td><td>96.6%</td><td><span class="pill zero">623 / 623</span></td><td>1</td></tr>
+          <tr><td>3 个（调严）</td><td>229 / 352</td><td>65.1%</td><td><span class="pill zero">623 / 623</span></td><td>2</td></tr>
+          <tr><td>4 个（最严）</td><td>80 / 352</td><td>22.7%</td><td><span class="pill zero">623 / 623</span></td><td>3</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cap-note">本表<strong>隔离压痕门槛这一个杠杆（未叠件级广度闸）</strong>，故 tm=2 显示 340（检出能力）；投产叠上广度闸后为 318/90.3%（见首屏）。要点：调松到 1 个 → <strong>10 张反面直接放行（逃逸，禁止）</strong>；调严到 3、4 个 → 反面零改善，正面过杀从 12 张暴涨到 123 / 272 张。所以 tm=2 是<strong>本征</strong>下限 —— 之所以不靠广度闸去兜 tm=1 的逃逸，正是不能让安全只压在一道闸上。另实测：圆度阈值在 0.60～0.90 全区间对门槛 2 <strong>毫无影响</strong>（七档同结果、零逃逸），硬圆度阈值不起作用、判定由软接受主导。</p>
+
+    <div class="chart-card" style="margin-top:18px">
+      <svg viewBox="0 0 680 360" role="img" aria-label="召回率随压痕数门槛调严而崩塌，反面逃逸在门槛≥2时始终为零">
+        <g font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--ink-3)">
+          <line x1="60" y1="30"  x2="640" y2="30"  stroke="var(--line)"/>
+          <line x1="60" y1="95"  x2="640" y2="95"  stroke="var(--line)"/>
+          <line x1="60" y1="160" x2="640" y2="160" stroke="var(--line)"/>
+          <line x1="60" y1="225" x2="640" y2="225" stroke="var(--line)"/>
+          <line x1="60" y1="290" x2="640" y2="290" stroke="var(--line-strong)"/>
+          <text x="52" y="34"  text-anchor="end">100</text>
+          <text x="52" y="99"  text-anchor="end">75</text>
+          <text x="52" y="164" text-anchor="end">50</text>
+          <text x="52" y="229" text-anchor="end">25</text>
+          <text x="52" y="294" text-anchor="end">0</text>
+        </g>
+        <g>
+          <rect x="112" y="32.9"  width="80" height="257.1" rx="3" fill="var(--danger)"/>
+          <rect x="244" y="38.8"  width="80" height="251.2" rx="3" fill="var(--safe)"/>
+          <rect x="376" y="120.7" width="80" height="169.3" rx="3" fill="var(--warn)"/>
+          <rect x="508" y="231.0" width="80" height="59.0"  rx="3" fill="var(--warn)"/>
+        </g>
+        <g font-family="IBM Plex Mono, monospace" font-size="14" font-weight="600" text-anchor="middle">
+          <text x="152" y="25"  fill="var(--danger)">98.9</text>
+          <text x="284" y="31"  fill="var(--safe)">96.6</text>
+          <text x="416" y="113" fill="var(--warn)">65.1</text>
+          <text x="548" y="223" fill="var(--warn)">22.7</text>
+        </g>
+        <g font-family="IBM Plex Mono, monospace" font-size="12.5" text-anchor="middle" fill="var(--ink-2)">
+          <text x="152" y="310">1 个</text>
+          <text x="284" y="310">2 个</text>
+          <text x="416" y="310">3 个</text>
+          <text x="548" y="310">4 个</text>
+        </g>
+        <g font-family="IBM Plex Mono, monospace" font-size="11.5" font-weight="600" text-anchor="middle">
+          <text x="152" y="330" fill="var(--danger)">反面逃逸 10</text>
+          <text x="284" y="330" fill="var(--safe)">反面 0 逃逸</text>
+          <text x="416" y="330" fill="var(--safe)">反面 0 逃逸</text>
+          <text x="548" y="330" fill="var(--safe)">反面 0 逃逸</text>
+        </g>
+        <text x="60" y="352" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--ink-3)">正面召回率 (%) · 横轴 = 压痕数门槛</text>
+      </svg>
+      <div class="legend">
+        <span><i style="background:var(--safe)"></i>当前配置（零逃逸）</span>
+        <span><i style="background:var(--warn)"></i>过杀上升</span>
+        <span><i style="background:var(--danger)"></i>反面逃逸（禁止）</span>
+      </div>
+    </div>
+
+    <div class="callout" style="margin-top:18px;border-left-color:var(--warn)">
+      <span class="mono">调严买不到裕度</span>
+      <p>领圈闸后反面仅剩 184 个通过特征 A 的孔，其中<strong>压痕数达到 2 的本来就是 0 个</strong>（最大只到 1）。门槛从 2 抬到 3、4，反面一个孔都不用多拦 —— 它压根摸不到 2。而抬门槛正面过杀从 12 张暴涨到 123、272 张。<strong>用上百张真 OK 去换一个反面本来就达不到的门槛，是纯亏。</strong>裕度那一列从 1 涨到 2、3，涨的是错觉。</p>
+    </div>
+  </section>
+
+  <!-- 已排除的算法路线 -->
+  <section aria-label="已排除的算法路线">
+    <div class="eyebrow">已系统排除的调参路线</div>
+    <h2>召回的上限不在算法参数上</h2>
+    <p class="lead">下述纯软件路线均已用全量数据验证，无一能在不放过 NG 的前提下把<strong>召回</strong>顶上去 —— 印证召回瓶颈在成像，不在参数。（注：领圈闸是唯一有效的软件杠杆，但它买的是<strong>安全裕度</strong>不是召回 —— 见上文「两道独立的闸」。）</p>
+    <div class="deadgrid">
+      <div class="dead">
+        <div class="h"><span class="x">✕</span>降低 Hough 灵敏度阈值 P2</div>
+        <p>P2 从 14 扫到 18，反面裕度恒为 1，与 P2 无关。</p>
+        <div class="res">降 P2 → 反而冒 29 张逃逸</div>
+      </div>
+      <div class="dead">
+        <div class="h"><span class="x">✕</span>增强图并入圆检测</div>
+        <p>CLAHE 增强让检出率回升，但在反面把机加工纹理放大成假圆。</p>
+        <div class="res">反面逃逸 0 → 547，崩溃</div>
+      </div>
+      <div class="dead">
+        <div class="h"><span class="x">✕</span>关闭宽松接受兜底</div>
+        <p>只认硬圆度，正面掉 58 张、反面裕度只换回 4 张（CFG5 实测）。代价 58 / 收益 4。</p>
+        <div class="res">正面大掉，严格反而更差</div>
+      </div>
+      <div class="dead">
+        <div class="h"><span class="x">✕</span>要求两孔同时通过</div>
+        <p>85% 检不出的前提下，真正面件也凑不齐两个好孔。</p>
+        <div class="res">召回崩到 73 / 352</div>
+      </div>
+      <div class="dead">
+        <div class="h"><span class="x">✕</span>用孔径 / 径向立体感区分正反</div>
+        <p>正反孔径实差仅约 3 丝（0.03mm），当前分辨率下接近噪声；径向亮度斜率实测方向还反了。同轴光下这两条量不出正面的“立体”。</p>
+        <div class="res">重叠严重，买不到零代价闸</div>
+      </div>
+      <div class="dead">
+        <div class="h"><span class="x">✕</span>扫圆度阈值 circmin</div>
+        <p>0.60～0.90 全区间对现状判定毫无影响 —— 硬阈值不起作用，判定由软接受主导。</p>
+        <div class="res">七档都是同一结果、零逃逸</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 梯度实测 -->
+  <section aria-label="成像死结的实测证据">
+    <div class="eyebrow">成像死结 · 实测证据</div>
+    <h2>漏检的压痕，和“根本没有压痕的平面”长得一样</h2>
+    <p class="lead">这是整份报告最硬的一组数据。对 1710 个拐角量了边缘梯度（Sobel 幅值的 95 分位）——圆检测内部用的 Canny 高阈值就是 110。检出、漏检、反面，四组一量，死结一目了然。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>拐角分组</th><th>样本数</th><th>梯度 p95</th><th>过阈值 110 的像素</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>正面 · <strong>检出的</strong>压痕</td><td>256</td><td><strong>154.6</strong></td><td>13.9%</td></tr>
+          <tr><td>正面 · <strong>漏检的</strong>压痕</td><td>640</td><td><strong>110.7</strong></td><td>5.2%</td></tr>
+          <tr><td>反面 · 有杂散边</td><td>11</td><td>109.0</td><td>4.9%</td></tr>
+          <tr><td>反面 · 无压痕</td><td>803</td><td>106.3</td><td>4.6%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cap-note">抽样 25 正面 + 25 反面图。读法：后三行几乎重合 —— <strong>一个被冲淡的真压痕（110.7），在边缘上与一张没有压痕的反面件（106.3）无法区分</strong>。</p>
+
+    <div class="chart-card" style="margin-top:18px">
+      <svg viewBox="0 0 680 300" role="img" aria-label="检出的压痕梯度远高于阈值110；漏检的压痕与无压痕反面几乎相同，都贴着阈值">
+        <g stroke="var(--line)">
+          <line x1="150" y1="24" x2="150" y2="266"/>
+          <line x1="272.5" y1="24" x2="272.5" y2="266"/>
+          <line x1="395" y1="24" x2="395" y2="266"/>
+          <line x1="517.5" y1="24" x2="517.5" y2="266"/>
+          <line x1="640" y1="24" x2="640" y2="266"/>
+        </g>
+        <line x1="419.5" y1="18" x2="419.5" y2="272" stroke="var(--danger)" stroke-width="2" stroke-dasharray="5 4"/>
+        <text x="419.5" y="14" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" font-weight="600" fill="var(--danger)">Canny 阈值 110</text>
+        <g>
+          <rect x="150" y="40"  width="378.8" height="34" rx="3" fill="var(--safe)"/>
+          <rect x="150" y="100" width="271.2" height="34" rx="3" fill="var(--warn)"/>
+          <rect x="150" y="160" width="267.1" height="34" rx="3" fill="var(--ink-3)" opacity=".55"/>
+          <rect x="150" y="220" width="260.4" height="34" rx="3" fill="var(--ink-3)" opacity=".4"/>
+        </g>
+        <g font-family="IBM Plex Mono, monospace" font-size="13.5" font-weight="600" text-anchor="start">
+          <text x="538" y="62"  fill="var(--safe)">154.6</text>
+          <text x="431" y="122" fill="var(--warn)">110.7</text>
+          <text x="427" y="182" fill="var(--ink-3)">109.0</text>
+          <text x="420" y="242" fill="var(--ink-3)">106.3</text>
+        </g>
+        <g font-family="IBM Plex Mono, monospace" font-size="12.5" text-anchor="end" fill="var(--ink-2)">
+          <text x="142" y="62">正面 · 检出</text>
+          <text x="142" y="122">正面 · 漏检</text>
+          <text x="142" y="182">反面 · 有杂边</text>
+          <text x="142" y="242">反面 · 无压痕</text>
+        </g>
+        <g font-family="IBM Plex Mono, monospace" font-size="11" text-anchor="middle" fill="var(--ink-3)">
+          <text x="150" y="290">0</text>
+          <text x="272.5" y="290">50</text>
+          <text x="395" y="290">100</text>
+          <text x="517.5" y="290">150</text>
+          <text x="640" y="290">200</text>
+        </g>
+      </svg>
+      <div class="legend">
+        <span><i style="background:var(--safe)"></i>边缘够强 · 检得出</span>
+        <span><i style="background:var(--warn)"></i>真压痕但边缘被冲淡</span>
+        <span><i style="background:var(--ink-3);opacity:.5"></i>反面（无压痕）</span>
+      </div>
+    </div>
+
+    <div class="callout" style="margin-top:18px;border-left-color:var(--danger)">
+      <span class="mono">为什么软件救不回</span>
+      <p>漏检压痕的梯度（110.7）和非压痕反面的梯度（106.3）只差 4 个单位。要把前者拉过 Canny 阈值，拉的就是后者的噪声 —— <strong>软件增强会把真信号和假边一起放大</strong>。这正是实测过的：把增强图并进圆检测，检出率是回来了，但反面逃逸从 0 直接爆到 547。这份区分度必须在<strong>成像阶段</strong>就挣回来，软件阶段已经没有了。</p>
+    </div>
+  </section>
+
+  <!-- 成像物理 -->
+  <section aria-label="成像天花板成因">
+    <div class="eyebrow">天花板的物理成因</div>
+    <h2>同轴光垂直照浅凹坑，近乎无影</h2>
+    <p class="lead">压痕是冲压形成的<strong>凹坑</strong>，不是黑斑。相机与内置补光是一体的同轴光：光顺镜头轴垂直打下、垂直反射回来，浅坑与台面反射几乎一致，边缘梯度极弱，圆检测的边缘算子抓不到。</p>
+    <div class="phys">
+      <div class="phys-diagram">
+        <svg viewBox="0 0 360 250" role="img" aria-label="同轴光垂直照射浅凹坑，反射均匀、边缘无对比；掠射光在凹坑边缘制造明暗差">
+          <!-- coaxial (current) -->
+          <text x="90" y="22" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="var(--danger)">同轴光（现状）</text>
+          <!-- surface -->
+          <path d="M20 150 H160 M70 150 q20 22 40 0" fill="none" stroke="var(--ink-2)" stroke-width="2.5"/>
+          <!-- dimple shading (faint) -->
+          <path d="M70 150 q20 22 40 0 z" fill="var(--ink-3)" opacity=".12"/>
+          <!-- vertical rays -->
+          <g stroke="var(--warn)" stroke-width="1.6">
+            <line x1="55" y1="45" x2="55" y2="150" marker-end="url(#ar)"/>
+            <line x1="90" y1="45" x2="90" y2="150" marker-end="url(#ar)"/>
+            <line x1="125" y1="45" x2="125" y2="150" marker-end="url(#ar)"/>
+          </g>
+          <text x="90" y="185" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--ink-3)">反射均匀 · 边缘无对比</text>
+          <text x="90" y="200" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--danger)">→ 检不出</text>
+
+          <!-- divider -->
+          <line x1="185" y1="30" x2="185" y2="215" stroke="var(--line)" stroke-dasharray="4 4"/>
+
+          <!-- grazing (proposed) -->
+          <text x="278" y="22" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="var(--safe)">低角掠射光（建议）</text>
+          <path d="M210 150 H350 M260 150 q20 22 40 0" fill="none" stroke="var(--ink-2)" stroke-width="2.5"/>
+          <!-- lit edge bright, far edge dark -->
+          <path d="M260 150 q10 18 20 11" fill="none" stroke="var(--safe)" stroke-width="3"/>
+          <path d="M280 161 q10 -7 20 -11" fill="none" stroke="var(--ink)" stroke-width="3" opacity=".55"/>
+          <!-- angled rays -->
+          <g stroke="var(--safe)" stroke-width="1.6">
+            <line x1="205" y1="55" x2="255" y2="150" marker-end="url(#ag)"/>
+            <line x1="225" y1="48" x2="272" y2="150" marker-end="url(#ag)"/>
+          </g>
+          <text x="278" y="185" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--ink-3)">一侧亮一侧暗 · 边缘变陡</text>
+          <text x="278" y="200" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--safe)">→ 可检出</text>
+
+          <defs>
+            <marker id="ar" markerWidth="7" markerHeight="7" refX="3.5" refY="6" orient="auto"><path d="M0 0 L3.5 6 L7 0 Z" fill="var(--warn)"/></marker>
+            <marker id="ag" markerWidth="7" markerHeight="7" refX="3.5" refY="6" orient="auto"><path d="M0 0 L3.5 6 L7 0 Z" fill="var(--safe)"/></marker>
+          </defs>
+        </svg>
+      </div>
+      <div class="phys-text">
+        <div class="row"><span class="n">01</span><p><strong>不是亮度问题。</strong>曝光已拉到 500ms、伽马 1.5，再高就过曝。全局亮度调不出局部边缘对比 —— 越调两边一起动。</p></div>
+        <div class="row"><span class="n">02</span><p><strong>压痕的信息软件补不回。</strong>压痕的边缘对比在成像阶段就丢了；软件强增强（CLAHE）会把真信号和反面纹理一起放大，制造假圆、引发逃逸。（翻边领圈是例外 —— 它的深度在同轴光下仍留下了可测的暗环，已被领圈闸利用；但压痕太浅，没有这种残留。）</p></div>
+        <div class="row"><span class="n">03</span><p><strong>相机不能倾斜。</strong>倾斜会把正圆压成椭圆，圆度判据失效，且孔径与拐角几何需全部重标。应保持 90° 俯视。</p></div>
+        <div class="row"><span class="n">04</span><p><strong>出路是加光。</strong>相机与同轴光原样保留，另加一圈贴台面的低角度环形光，让真凹坑边缘发亮、反面不造假边 —— 把真假之分做在光学层面。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 结论 -->
+  <section aria-label="结论与建议">
+    <div class="eyebrow">结论与建议</div>
+    <div class="concl">
+      <div class="band">◆ 零逃逸已达成，且是两道独立的闸；再往前走的关键在光</div>
+      <div class="body">
+        <ol>
+          <li><strong>安全已达标：两道独立的闸 + 一道件级广度闸。</strong>623 张反面件零逃逸。领圈深度闸把特征 A 补回成真闸（反面孔级 47.0%→3.5%、图片级 86.7%→15.7%），特征 B 独自把反面压到 1.9% —— A、B 各自都能否决反面。再叠件级广度闸（要求整件≥4 个孔见到压痕），把逃逸门槛从<strong>「1 个孔侥幸」抬到「4 个孔各自侥幸」</strong>。这一点在振动盘场景尤其重要：NG 件被踢下去会反复回流、每趟都是一次逃逸抽奖，每趟裕度必须尽量厚。</li>
+          <li><strong>调参数的杠杆已经用尽（能加安全的都加了）。</strong>调松（门槛 1）→ 13 张逃逸；调严（门槛 3、4）→ 反面零改善、真件误杀 100～222 张。加上 P2、并集检测、关软接受、扫圆度阈值均实测无效。领圈闸是唯一有效的一条，已锁定 0.12（免费段内最紧档，正面召回一张不掉）。剩下 3.4%（12 张）是过杀，不是逃逸。</li>
+          <li><strong>改成像，同时解锁召回和裕度 —— 这是要点。</strong>定位锚定修复把检出能力抬到 96.6%（290→340），件级广度闸再为安全让出到投产的 90.3%。要把这两者都往上顶（召回更高、且门槛能安全从 2 抬到 3 让<strong>裕度更厚</strong>），瓶颈都在同一处：压痕在同轴光下检不出。改光是唯一能同时解决召回与裕度的动作。</li>
+        </ol>
+        <div class="rec">
+          <b>建议：</b>先按现有参数投产（零逃逸、两道独立闸 + 件级广度闸、正面召回 90.3%，可立即用；过杀由振动盘回流吸收）。上线后留意振动盘里是否有好件一直转不出去（系统性欠冲压的好件会反复被踢）；若堆积明显，可把广度闸 K 从 4 退到 3（召回回到 94.0%）。要再往上走 —— 既提召回又加厚反面裕度 —— 唯一有效投入是<b>增加一圈低角度环形外部光</b>（相机与同轴光不动，加一个光学配件，不是重构工位）。算法侧的活已经做完了。
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>数据来源 · dbg_report.py 全量扫描 · _diag_edge.py 梯度诊断 · analyze_feature_ab.py</span>
+    <span>样本 975 帧 · imageDataClass · 2026-09-22</span>
+  </footer>
+
+</div>
+
+<script>
+  (function(){
+    var btn=document.getElementById('themeBtn');
+    if(!btn) return;
+    btn.addEventListener('click',function(){
+      var root=document.documentElement;
+      var cur=root.getAttribute('data-theme');
+      var dark=cur? cur==='dark' : matchMedia('(prefers-color-scheme:dark)').matches;
+      root.setAttribute('data-theme', dark? 'light':'dark');
+    });
+  })();
+</script>
