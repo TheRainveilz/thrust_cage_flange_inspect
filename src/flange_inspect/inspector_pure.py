@@ -253,7 +253,7 @@ PART_LOGIC = "OR"  # 孔之间: "OR" = 任一孔满足即 OK (按需求 5)
 PART_MIN_PASS_HOLES = 1  # PART_LOGIC="OR" 下, 需要多少个受检孔同时(A&B)通过才判 OK(可回退)。
 #   1=现状(任一孔过即 OK); 提到 2 = 要求至少 2 个孔都过, 收紧单孔临界逃逸。PART_LOGIC="AND" 时此值忽略。回退: 设 1。
 
-# ---------- 8b. 前置闸: 孔必须落在节圆上 ----------
+# ---------- 8a. 前置闸: 孔必须落在节圆上 ----------
 # 2026-09-21 实测(tools/_diag_localize.py, 975 张 / 8598 受检孔, HOLE_CHECK_COUNT=0):
 #   孔心到 part_cx/cy 的距离与 pitch_r 比, 正面只有 76.6% 在节圆上(散度 mad=0.03 hole_r, 定位是准的);
 #   反面只有 23.1%(mad=1.04 hole_r —— 孔心根本不落在任何同心圆上, 是一堆伪圆);
@@ -270,6 +270,18 @@ HOLE_PITCH_TOL_RATIO = PITCH_FIT_TOL_RATIO  # 内点容差, 与节圆拟合 fit_
 # 2026-09-21 实测教训: 早先版本对非 pitch_fit 直接**关掉**闸, 结果 410 张反面图在"定位最不可信"
 # 的状态下变成无闸放行, 立刻冒出 3 张 NG->OK 逃逸。方向必须反过来: 定位越不可信, 闸越要否决。
 HOLE_PITCH_GATE_METHODS = ("pitch_fit",)
+
+# ---------- 8b. 件级压痕广度闸(2026-09-22 用户提议, 已锁 K=4) ----------
+# 判 OK 除"有一个孔 on_pitch&A&压痕>=MIN_VALID_MARKS"外, 再 AND 一条件级要求:
+#   整件 on_pitch 孔里 "至少有 1 个压痕" 的孔数 >= PART_MIN_MARKED_HOLES。
+# 物理依据: 反面是冲穿件, 从没被冲压过, 压痕是纯噪声/假检 —— 全量 975 张实测(tools/_diag_breadth.py):
+#   正面 OK 的"有>=1痕的孔数" p10=4/中位7/max11; 反面 NG p90=0/max仅3, 且没有任何 NG 孔能凑到 2 痕。
+#   两条分布几乎无重叠。K=4 门槛**严格高过全部 623 张 NG 的观测上限(3)**。
+# 它硬化的是特征B对**单孔侥幸**的抗性(不是新物理维度, 仍是压痕证据的整件汇总): 逃逸从"1 个孔侥幸凑 2 痕"
+#   抬到"要 4 个不同孔各自冒压痕"。方向 fail-safe(只收紧、绝不增逃逸)。全量验收: 正面 340->318/352(90.3%),
+#   逃逸 0/623 不变。过杀代价在振动盘回流场景下基本被吸收(误踢的好件转一圈重拍, 随机漏检那趟会补回)。
+# 回退: 设 0 关闭。
+PART_MIN_MARKED_HOLES = 4
 
 # ---------- 9. 调试 / 存图 ----------
 PRINT_DEBUG = True  # 打印每孔轮廓计数、有效压痕数、判定结果
@@ -2186,12 +2198,23 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
         part_ok = sum(bool(q.passed) for q in checked_holes) >= PART_MIN_PASS_HOLES
     else:
         part_ok = all(q.passed for q in checked_holes)
+    # 件级压痕广度闸: 整件 on_pitch 孔里"至少 1 痕"的孔数不够, 一票否决(fail-safe, 只收紧)。
+    n_marked_holes = sum(1 for q in checked_holes if q.on_pitch and q.valid_marks >= 1)
+    breadth_ok = n_marked_holes >= PART_MIN_MARKED_HOLES
+    if PART_MIN_MARKED_HOLES > 0 and not breadth_ok:
+        part_ok = False
     if part_ok:
         res.verdict, res.reason = OK_PASS, "存在翻边外圈 + 冲压小圆压痕(正面)"
     else:
         res.verdict = NG_NO_FEATURE
         n_gated = sum(1 for q in checked_holes if not q.on_pitch)
-        if n_gated:
+        base_pass = (sum(bool(q.passed) for q in checked_holes) >= PART_MIN_PASS_HOLES
+                     if PART_LOGIC == "OR" else all(q.passed for q in checked_holes))
+        if PART_MIN_MARKED_HOLES > 0 and base_pass and not breadth_ok:
+            # 有孔过了 A&B, 但整件压痕太稀(广度闸): 说清是被广度否决, 便于产线定位是不是过杀。
+            res.reason = ("有孔满足翻边+压痕, 但整件仅 %d 个孔见到压痕(<%d), 件级压痕广度闸否决"
+                          % (n_marked_holes, PART_MIN_MARKED_HOLES))
+        elif n_gated:
             res.reason = ("所有受检孔均无有效翻边/压痕特征(反面或漏冲); "
                           "另有 %d/%d 个受检孔不在节圆上, 已被前置闸直接否决"
                           % (n_gated, len(checked_holes)))
