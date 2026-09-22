@@ -1,0 +1,25 @@
+# =====================================================================
+# 推力保持架翻边止口视觉检测 —— Python 依赖清单
+# =====================================================================
+# 一键安装:  python install.py   (Windows 可直接双击 install.bat)
+# 手动安装:  pip install -r requirements.txt
+#
+# 说明:
+#   1) 需要 Python >= 3.11 (见 pyproject.toml)。
+#   2) bcorner 是随仓库附带的已编译 C++ 扩展(src/flange_inspect/bcorner.*.pyd)，
+#      不通过 pip 安装；inspector_cpp.py 才用得到，inspector_pure.py 不依赖它。
+#   3) 版本约束与 pyproject.toml 保持同源，改动请两边一起改。
+# ---------------------------------------------------------------------
+
+# ---------- 核心运行依赖 (本地/相机/UNO 主链路必装) ----------
+numpy>=2.4.6
+# opencv 必须精确 pin: 与 C++ 扩展(bcorner)链接的 OpenCV 4.14.0 对齐，
+# 消除 remap/轮廓等亚像素差异导致的判定漂移。切勿放宽此约束。
+opencv-python==4.14.0.94
+pyserial>=3.5
+
+# ---------- 可选依赖 (按运行模式启用；默认全部装上以便一键跑通) ----------
+# http  相机模式取图 / 回传时才用到 (代码内延迟 import，本地调试可不装)
+requests>=2.28
+# ENABLE_MODBUS=True 经 Modbus-TCP 回报 PLC 时才用到 (默认关，现场靠 UNO 直连 PLC)
+pymodbus>=3.0
