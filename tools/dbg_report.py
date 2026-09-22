@@ -60,7 +60,8 @@ REQ_CONSTS = ("CORNER_SPEC", "CORNER_WIN_RATIO", "MARK_R_RATIO_RANGE", "MARK_HOU
               "MARK_HOUGH_P2", "MARK_CENTER_GATE", "MARK_MASK_RATIO", "MARK_THRESH_PCTS",
               "MARK_MIN_AREA_RATIO", "MARK_CIRCULARITY_MIN", "MIN_VALID_MARKS",
               "RING_ROI_RATIO", "RING_MASK_RATIO", "HOLE_CHECK_COUNT", "HOLE_LOGIC",
-              "PART_LOGIC", "FEATURE_A_MODE", "OK_PASS", "NG_SAVE_DIR", "LOCAL_IMAGE_DIR",
+              "PART_LOGIC", "PART_MIN_PASS_HOLES", "PART_MIN_MARKED_HOLES",
+              "FEATURE_A_MODE", "OK_PASS", "NG_SAVE_DIR", "LOCAL_IMAGE_DIR",
               "IMAGE_EXTS")
 REQ_CORNER_KEYS = ("angle", "cx", "cy", "ok", "circ", "r", "in_frame")
 
@@ -637,8 +638,19 @@ def verdict_at(item: dict, tc: float, tm: int) -> bool:
     # 与主模块一致: OR 逻辑下需要 >= PART_MIN_PASS_HOLES 个孔通过(不是任一孔),
     # AND 逻辑下要求全部孔通过。PART_MIN_PASS_HOLES 是加厚裕度的结构性杠杆, 必须在此建模。
     if T.PART_LOGIC == "OR":
-        return sum(bool(f) for f in flags) >= getattr(T, "PART_MIN_PASS_HOLES", 1)
-    return all(flags)
+        part_ok = sum(bool(f) for f in flags) >= getattr(T, "PART_MIN_PASS_HOLES", 1)
+    else:
+        part_ok = all(flags)
+    # 件级压痕广度闸: 整件 on_pitch 孔里"至少 1 痕(按 tc 判)"的孔数 < K 则一票否决。
+    # 镜像主模块 inspector_pure 的 n_marked_holes >= PART_MIN_MARKED_HOLES(只收紧、绝不增逃逸)。
+    # 只在 part_ok 时判——广度闸只把 OK 翻成 NG，不会救回 NG。
+    k_marked = getattr(T, "PART_MIN_MARKED_HOLES", 0)
+    if k_marked > 0 and part_ok:
+        n_marked = sum(1 for h in item["holes"]
+                       if h.get("on_pitch", True) and _hole_marks(h, tc) >= 1)
+        if n_marked < k_marked:
+            part_ok = False
+    return part_ok
 
 
 def margin_at(item: dict, tc: float, tm: int) -> Optional[int]:
@@ -671,7 +683,16 @@ def margin_at(item: dict, tc: float, tm: int) -> Optional[int]:
         key = sorted(counts, reverse=True)[k - 1]              # 第 k 强孔的压痕数
     else:
         key = min(counts)                                      # AND: 看最弱孔
-    return (key - tm) if verdict_at(item, tc, tm) else (tm - key)
+    if verdict_at(item, tc, tm):
+        return key - tm                                        # 判 OK: 决定孔还能掉几个(基础闸口径)
+    # 判 NG: 翻成 OK 需**同时**满足 基础闸(决定孔补到 tm) 与 件级广度闸(K 个孔各见 >=1 痕)。
+    # 取二者所需较大值 —— 广度闸让"补压痕翻判"更难, 这样 NG 裕度不会被基础闸单独低估, 也绝不出负。
+    base_need = tm - key
+    k_marked = getattr(T, "PART_MIN_MARKED_HOLES", 0)
+    if k_marked > 0:
+        n_marked = sum(1 for h in holes if h.get("on_pitch", True) and _hole_marks(h, tc) >= 1)
+        return max(base_need, k_marked - n_marked)
+    return base_need
 
 
 def min_margin(items: List[dict], tc: float, tm: int) -> Optional[int]:
