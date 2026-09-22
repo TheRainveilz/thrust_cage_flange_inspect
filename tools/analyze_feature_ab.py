@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
                          "结构上只增过杀、绝不增逃逸。默认按模块当前值(关)")
     ap.add_argument("--collar-min", type=float, default=None,
                     help="覆盖 COLLAR_DARKFRAC_MIN 阈值(默认用模块值)；配合 --collar-gate 扫阈值")
+    ap.add_argument("--min-marks", type=int, default=None,
+                    help="覆盖 MIN_VALID_MARKS(每孔判特征B所需的有效压痕数)；默认用模块当前值")
+    ap.add_argument("--part-min-marked-holes", type=int, default=None,
+                    help="覆盖 PART_MIN_MARKED_HOLES(件级压痕广度闸：整件须>=该数个on_pitch孔各见>=1痕)；"
+                         "0=关闭该闸。默认用模块当前值(投产=4)")
     return ap.parse_args()
 
 
@@ -196,8 +201,15 @@ def print_group(title: str, rows: List[ImageStat]) -> None:
     pair_holes = sum(r.pair_pass for r in valid)
     times = [r.elapsed_ms for r in valid]
 
+    # 实际件级判定(result.is_ok, 含节圆闸 + 领圈闸 + 件级压痕广度闸)。这才是"判 OK"。
+    ok_verdict = sum(1 for r in valid if r.verdict == "OK")
     print(f"\n[{title}] 图片 {len(rows)} 张，成功分析 {len(valid)} 张")
-    print("  图片级: A通过=%d/%d (%s) | B通过=%d/%d (%s) | A+B同时通过=%d/%d (%s)"
+    print("  ★ 件级判OK(实际判定, 含节圆/领圈/广度闸)=%d/%d (%s)"
+          % (ok_verdict, denom, pct(ok_verdict, denom)))
+    # 下面三项是"孔级汇总"诊断: 某孔通过 A / B / A&B 就算该图命中。
+    # 注意 "A+B同时通过" 是**孔级 pair**(有孔过 A&B), **不含件级广度闸** —— 当广度闸开启时,
+    # 它会 >= 上面的实际判OK(有孔过 A&B、但整件见痕的孔不够 K, 会被广度闸翻成 NG)。
+    print("  图片级(孔级汇总,诊断): A通过=%d/%d (%s) | B通过=%d/%d (%s) | A+B同时通过(未计广度闸)=%d/%d (%s)"
           % (a_images, denom, pct(a_images, denom),
              b_images, denom, pct(b_images, denom),
              pair_images, denom, pct(pair_images, denom)))
@@ -280,6 +292,17 @@ def main() -> int:
             print("[WARN] %s 无 COLLAR_GATE, 忽略 --collar-gate" % args.impl)
     if hasattr(T, "COLLAR_GATE"):
         print("[INFO] COLLAR_GATE:", T.COLLAR_GATE, " COLLAR_DARKFRAC_MIN:", T.COLLAR_DARKFRAC_MIN)
+    # 每孔判 B 所需压痕数(见 inspector_pure.MIN_VALID_MARKS)。tm=2 是唯一最优点(松→逃逸/严→过杀)。
+    if args.min_marks is not None and hasattr(T, "MIN_VALID_MARKS"):
+        T.MIN_VALID_MARKS = args.min_marks
+    if hasattr(T, "MIN_VALID_MARKS"):
+        print("[INFO] MIN_VALID_MARKS:", T.MIN_VALID_MARKS)
+    # 件级压痕广度闸(见 inspector_pure.PART_MIN_MARKED_HOLES)。判 OK 除"有一个孔过 A&B"外, 还要求整件
+    # >=该数个 on_pitch 孔各见 >=1 痕。把逃逸门槛从"1 孔侥幸"抬到"K 孔各自侥幸"; 只收紧、绝不增逃逸。
+    if args.part_min_marked_holes is not None and hasattr(T, "PART_MIN_MARKED_HOLES"):
+        T.PART_MIN_MARKED_HOLES = args.part_min_marked_holes
+    if hasattr(T, "PART_MIN_MARKED_HOLES"):
+        print("[INFO] PART_MIN_MARKED_HOLES:", T.PART_MIN_MARKED_HOLES)
     rows = []
     for index, path in enumerate(paths, 1):
         row = inspect_one(T, path)
