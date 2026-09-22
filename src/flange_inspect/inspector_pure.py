@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import socket
 import struct
 import sys
@@ -37,7 +38,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
-from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
@@ -305,9 +306,16 @@ SAVE_QUEUE_SIZE = 64  # 结果图后台存图队列深度；满了丢最旧留�
 SAVE_JOIN_TIMEOUT_S = 3.0  # 停机时等后台存图线程排空并退出的上限
 RAW_SAVE_ON_ASSEMBLY = True  # RAW 落盘点提前到帧组装(采集线程)：协议丢帧/队列过载/判定超时都不会吃掉 RAW
 RAW_SAVE_QUEUE_SIZE = 512  # RAW 专用大队列(与结果图分开)：RAW 必须与传感器张数对齐，尽量不丢；正常永远填不满
-RUNTIME_LOG_DIR = os.path.join(DEFAULT_DATA_DIR, "logs")  # 运行日志默认目录(项目根/data/logs)；启动时自动创建
-RUNTIME_LOG_MAX_BYTES = 10 * 1024 * 1024  # 单个日志文件上限(10 MiB)，超过滚动切分
-RUNTIME_LOG_BACKUP_COUNT = 5  # 滚动保留的历史日志份数(共 5 份，加当前=最多 6 个文件)
+RUNTIME_LOG_DIR = os.path.join(DEFAULT_DATA_DIR, "logs")  # 运行日志根目录(项目根/data/logs)；其下按北京时间自动建 YYYY/MM/DD/
+# 单个日志文件上限：20 MiB。选它的理由——一天的日志会按北京时间自动分天存放，
+# 当天再按此上限滚动出 _01/_02...多个分片，保证任何单个文件都足够小(约 15 万行/文件)，
+# 用编辑器/tail/grep 打开都是秒开、绝不会因为单文件过大卡死。改大=文件更少但更慢，改小=文件更多。
+RUNTIME_LOG_MAX_BYTES = 20 * 1024 * 1024
+# 运行日志最长保留天数(按北京时间算)。**默认 0 = 关闭清理、永久保留**——出故障时旧日志一定还在，方便 debug。
+# 需要时设 >0(如 7)才启用：由后台线程每 RUNTIME_LOG_PURGE_INTERVAL_S 巡一次，只删**确实超过该天数**的整天目录。
+# 刻意不在"换天"或"程序重启"时清，避免在排查现场把刚需要的旧日志删掉。
+RUNTIME_LOG_RETAIN_DAYS = 7
+RUNTIME_LOG_PURGE_INTERVAL_S = 6 * 3600  # 启用清理后，后台线程多久巡一次(默认 6 小时)；启动后先睡一轮再清
 
 # ---------- 10. Modbus-TCP 对接 PLC (占位, 默认关闭) ----------
 ENABLE_MODBUS = False  # Modbus-TCP 回报 PLC 总开关: 当前占位默认关(现场靠 UNO 直连 PLC, 见下)
@@ -343,26 +351,166 @@ OK_PASS = "OK"  # 合格判定值; is_ok 仅当 verdict==OK_PASS
 RUNTIME_LOGGER = logging.getLogger("thrust_cage_inspect")
 RUNTIME_LOGGER.addHandler(logging.NullHandler())
 
+BEIJING_TZ = timezone(timedelta(hours=8))  # 东八区(中国全年无夏令时，固定 +8)，日志分天/命名一律按它
+
+
+def purge_old_logs(root_dir: str, retain_days: int) -> int:
+    """删除超过保留期的整天日志目录(<root>/YYYY/MM/DD)，返回删除的天数目录个数。
+    保留最近 retain_days 天(含今天，按北京时间)；retain_days<=0 表示永久保留不清理。
+    顺带清掉变空的月/年目录。任何单目录删除失败都跳过、不影响其它，绝不抛异常打断日志。"""
+    if retain_days <= 0 or not os.path.isdir(root_dir):
+        return 0
+    keep_from = datetime.now(BEIJING_TZ).date() - timedelta(days=retain_days - 1)
+    removed = 0
+    for y in list(os.listdir(root_dir)):
+        ypath = os.path.join(root_dir, y)
+        if not (len(y) == 4 and y.isdigit() and os.path.isdir(ypath)):
+            continue
+        for m in list(os.listdir(ypath)):
+            mpath = os.path.join(ypath, m)
+            if not (len(m) == 2 and m.isdigit() and os.path.isdir(mpath)):
+                continue
+            for d in list(os.listdir(mpath)):
+                dpath = os.path.join(mpath, d)
+                if not (len(d) == 2 and d.isdigit() and os.path.isdir(dpath)):
+                    continue
+                try:
+                    day = datetime(int(y), int(m), int(d)).date()
+                except ValueError:
+                    continue
+                if day < keep_from:
+                    shutil.rmtree(dpath, ignore_errors=True)
+                    removed += 1
+            try:  # 月目录空了就删
+                if not os.listdir(mpath):
+                    os.rmdir(mpath)
+            except OSError:
+                pass
+        try:  # 年目录空了就删
+            if not os.listdir(ypath):
+                os.rmdir(ypath)
+        except OSError:
+            pass
+    return removed
+
+
+def start_log_purge_daemon(root_dir: str, retain_days: int, interval_s: float):
+    """启用日志清理时(retain_days>0)起一个后台守护线程：每 interval_s 巡一次，只删超期整天目录。
+    刻意**先睡一轮再清**(不在启动瞬间清)，也不挂在换天事件上——避免排查现场误删刚需要的旧日志。
+    retain_days<=0 时返回 None、什么都不做(默认关闭)。"""
+    if retain_days <= 0:
+        return None
+
+    def _loop() -> None:
+        while True:
+            time.sleep(max(60.0, interval_s))
+            try:
+                n = purge_old_logs(root_dir, retain_days)
+                if n:
+                    RUNTIME_LOGGER.info("[LOG-PURGE] 已清理超过 %d 天的日志目录 %d 个", retain_days, n)
+            except Exception:  # noqa: BLE001
+                pass
+
+    t = threading.Thread(target=_loop, name="log-purge", daemon=True)
+    t.start()
+    return t
+
+
+class DailyDirRotatingHandler(logging.Handler):
+    """按**北京时间**分天存运行日志：<root>/YYYY/MM/DD/runtime_YYYYMMDD[_NN].log。
+
+    - 每天 00:00:00(东八区)自动切到新一天的目录与文件(与服务器本地时区无关，始终按 +8 判天)；
+    - 当天单个文件写满 max_bytes 就在**同一天目录内**滚动出 _01/_02...，避免单文件过大卡死；
+    - 重启后当天从已存在的最大分片续写，不覆盖历史。
+    """
+
+    def __init__(self, root_dir: str, max_bytes: int) -> None:
+        super().__init__()
+        self.root_dir = root_dir
+        self.max_bytes = max(0, int(max_bytes))
+        self._day: Optional[str] = None   # 当前打开文件对应的北京日期 "YYYYMMDD"
+        self._seq = 0                     # 当天分片序号(0=首个不带后缀)
+        self._size = 0                    # 当前文件已写字节
+        self._stream = None
+        self.current_path: Optional[str] = None
+
+    def _paths(self, dt: datetime, seq: int) -> Tuple[str, str]:
+        day_dir = os.path.join(self.root_dir, "%04d" % dt.year,
+                               "%02d" % dt.month, "%02d" % dt.day)
+        day = dt.strftime("%Y%m%d")
+        name = ("runtime_%s.log" % day) if seq == 0 else ("runtime_%s_%02d.log" % (day, seq))
+        return day_dir, os.path.join(day_dir, name)
+
+    def _open(self, dt: datetime, seq: int) -> None:
+        day_dir, path = self._paths(dt, seq)
+        os.makedirs(day_dir, exist_ok=True)
+        self._stream = open(path, "a", encoding="utf-8")
+        self.current_path = path
+        self._seq = seq
+        try:
+            self._size = os.path.getsize(path)
+        except OSError:
+            self._size = 0
+
+    def _switch_day(self, dt: datetime) -> None:
+        if self._stream:
+            self._stream.close()
+            self._stream = None
+        self._day = dt.strftime("%Y%m%d")
+        seq = 0
+        while os.path.exists(self._paths(dt, seq + 1)[1]):  # 重启续写当天最大分片
+            seq += 1
+        self._open(dt, seq)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            dt = datetime.now(BEIJING_TZ)
+            day = dt.strftime("%Y%m%d")
+            line = self.format(record) + "\n"
+            data = line.encode("utf-8")
+            if day != self._day or self._stream is None:
+                self._switch_day(dt)
+            elif (self.max_bytes and self._size > 0
+                  and self._size + len(data) > self.max_bytes):
+                self._stream.close()
+                self._open(dt, self._seq + 1)
+            self._stream.write(line)
+            self._stream.flush()
+            self._size += len(data)
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
+
+    def close(self) -> None:
+        try:
+            if self._stream:
+                self._stream.close()
+                self._stream = None
+        finally:
+            super().close()
+
 
 def setup_runtime_logging() -> None:
-    """运行日志同时写控制台和滚动文件，采集故障重启后仍可追溯。"""
+    """运行日志同时写控制台和(按北京时间分天的)滚动文件，采集故障重启后仍可追溯。"""
     RUNTIME_LOGGER.handlers.clear()
     RUNTIME_LOGGER.setLevel(logging.INFO)
     RUNTIME_LOGGER.propagate = False
     formatter = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
                                   datefmt="%Y-%m-%d %H:%M:%S")
+    # 行内时间戳也统一按北京时间，保证与 YYYY/MM/DD 目录、文件名日期一致(即使服务器时区被设歪)。
+    formatter.converter = lambda ts: datetime.fromtimestamp(ts, BEIJING_TZ).timetuple()
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     RUNTIME_LOGGER.addHandler(console)
     try:
-        os.makedirs(RUNTIME_LOG_DIR, exist_ok=True)
-        path = os.path.join(RUNTIME_LOG_DIR, "runtime.log")  # 直接落在日志目录内
-        handler = RotatingFileHandler(path, maxBytes=RUNTIME_LOG_MAX_BYTES,
-                                      backupCount=RUNTIME_LOG_BACKUP_COUNT,
-                                      encoding="utf-8")
+        handler = DailyDirRotatingHandler(RUNTIME_LOG_DIR, RUNTIME_LOG_MAX_BYTES)
         handler.setFormatter(formatter)
         RUNTIME_LOGGER.addHandler(handler)
-        RUNTIME_LOGGER.info("[START] 运行日志: %s", path)
+        retain_txt = ("保留 %d 天(后台每 %.0fh 巡清)" % (RUNTIME_LOG_RETAIN_DAYS,
+                      RUNTIME_LOG_PURGE_INTERVAL_S / 3600.0)
+                      if RUNTIME_LOG_RETAIN_DAYS > 0 else "永久保留(清理默认关闭)")
+        RUNTIME_LOGGER.info("[START] 运行日志(北京时间分天，%s): %s", retain_txt, RUNTIME_LOG_DIR)
+        start_log_purge_daemon(RUNTIME_LOG_DIR, RUNTIME_LOG_RETAIN_DAYS,
+                               RUNTIME_LOG_PURGE_INTERVAL_S)
     except OSError as exc:
         RUNTIME_LOGGER.error("[LOG-ERROR] 无法创建文件日志: %s", exc)
 
@@ -2658,7 +2806,7 @@ def guess_label(name: str) -> Optional[bool]:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """解析命令行参数(取图模式/存图/标定/采样/耗时等); 默认值取自头部参数区常量。"""
-    ap = argparse.ArgumentParser(description="推力保持架垫片 冲压翻边正/反面检测")
+    ap = argparse.ArgumentParser(description="推力保持架垫片 冲压翻边正/反面检测",formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=80))
     ap.add_argument("--mode", choices=("local", "camera", "watch", "http"), default=SOURCE_MODE,
                     help="取图方式: local=遍历目录, camera=10001 私有协议真直连(产线推荐), "
                          "watch=监视存图目录, http=相机 HTTP 接口(本机这台无 Web 服务)")
@@ -2769,6 +2917,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global SAVE_OVERLAY, SAVE_IMAGE_EXT, OK_SAVE_DIR, NG_SAVE_DIR
     if args.debug or args.save_ok:
         SAVE_OK_IMAGE = True
+    if args.debug:
+        # --debug 才把日志级别降到 DEBUG：让平时降噪隐藏的逐帧明细(INSPECT-START/RESULT-SAVED/
+        # 帧分隔线/每孔耗时)重新打出来，排查时用。默认(INFO)只保留一帧一行的 [INSPECT-DONE]。
+        RUNTIME_LOGGER.setLevel(logging.DEBUG)
+        RUNTIME_LOGGER.info("[START] --debug：日志级别=DEBUG，逐帧明细已开")
     if args.holes is not None:
         HOLE_CHECK_COUNT = args.holes
 
@@ -2810,10 +2963,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print('       python dbg_report.py --dir "%s" --holes 0 --sweep --truth front|back'
               % os.path.abspath(args.collect))
     if args.timing:
+        # 本地回放没有网络取图、也不落 RAW，那句"存图已异步/raw 不在关键路径"无意义，只在相机模式打。
+        raw_note = ("；存图已异步，raw/result_save_ms 不在关键路径"
+                    if args.mode != "local" else "")
         RUNTIME_LOGGER.info(
             "[TIMING-ON] 详细耗时已开启，超时预算=%.1fms 只约束算法本身(入队→判定，"
-            "不含网络取图/存图 IO)；存图已异步，raw/result_save_ms 不在关键路径",
-            RESULT_DEADLINE_MS)
+            "不含网络取图/存图 IO)%s",
+            RESULT_DEADLINE_MS, raw_note)
     try:
         source = build_source(args.mode, args.dir, args.ip)
     except Exception as exc:  # noqa: BLE001
