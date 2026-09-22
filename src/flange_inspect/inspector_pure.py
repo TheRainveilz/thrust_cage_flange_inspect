@@ -821,9 +821,14 @@ class TimingStats:
         for key in sorted(self.samples):
             recent = list(self.samples[key])
             count = self.metric_counts[key]
+            # inspect.<阶段> 用中文显示(_STAGE_CN 见文件后段, 运行期才调用故可前向引用)。
+            disp = key
+            if key.startswith("inspect."):
+                suf = key[len("inspect."):]
+                disp = "阶段." + _STAGE_CN.get(suf, suf)
             lines.append(
                 "[TIMING-SUMMARY] %s count=%d min=%.2f mean=%.2f recent_p95=%.2f max=%.2f"
-                % (key, count, self.mins[key], self.totals[key] / count,
+                % (disp, count, self.mins[key], self.totals[key] / count,
                    self._percentile(recent, 95.0), self.maxs[key]))
         return lines
 
@@ -2483,7 +2488,8 @@ class AsyncImageSaver:
         should = (res.is_ok and SAVE_OK_IMAGE) or ((not res.is_ok) and SAVE_NG_IMAGE)
         path = save_result_image(bgr, res, overlay=overlay)
         if path:
-            RUNTIME_LOGGER.info("[RESULT-SAVED] image=%s path=%s", res.name, path)
+            # 存图是异步、比当前帧慢一拍，放 INFO 会插进别帧中间搅乱阅读，降到 DEBUG。
+            RUNTIME_LOGGER.debug("[RESULT-SAVED] image=%s path=%s", res.name, path)
         elif should:
             self.result_fail += 1
             RUNTIME_LOGGER.error("[RESULT-ERROR] image=%s 结果图保存失败", res.name)
@@ -2692,14 +2698,37 @@ def _fmt_ms(value: Optional[float]) -> str:
     return "-" if value is None else "%.2f" % value
 
 
+def _short_name(name: str) -> str:
+    """从图名里抽出 CAM#编号 作短标识；没有就用去扩展名的文件名。"""
+    base = os.path.basename(name or "")
+    i = base.find("CAM#")
+    if i >= 0:
+        j = i + 4
+        while j < len(base) and base[j].isdigit():
+            j += 1
+        return base[i:j]
+    return os.path.splitext(base)[0]
+
+
+# 计时阶段英文键 -> 中文显示名(仅用于 --timing 日志，不改 timings_ms 的键，避免影响其它引用)。
+_STAGE_CN = {
+    "preprocess": "预处理", "hole_candidates": "找孔候选", "hole_refine": "精修孔",
+    "part_locate": "定位工件", "hole_select": "选孔", "feature_a": "特征A翻边",
+    "feature_b": "特征B压痕", "final_decision": "最终判定",
+}
+
+
 def log_frame_timing(name: str, timing: FrameTiming, res: InspectResult) -> None:
     """--timing 的逐帧总览及算法内部明细。"""
+    # 太长，拆两行：第一行帧号+图路径，第二行各项耗时；两行都带 [TIMING] 标记(各自带时间戳/级别)。
     RUNTIME_LOGGER.info(
-        "[TIMING] frame=%s image=%s raw=%s effective=%s late=%s control_late=%s "
+        "[TIMING] frame=%s image=%s",
+        timing.frame_id if timing.frame_id is not None else "-", name)
+    RUNTIME_LOGGER.info(
+        "[TIMING] raw=%s effective=%s late=%s control_late=%s "
         "acquisition=%sms queue=%sms bgr=%sms inspect=%sms uno=%sms plc=%sms "
         "raw_save=%sms result_save=%sms rx_to_decision=%sms rx_to_control=%sms "
         "rx_to_full=%sms margin=%sms queue_depth=%s",
-        timing.frame_id if timing.frame_id is not None else "-", name,
         timing.raw_verdict, timing.effective_verdict, timing.late, timing.control_late,
         _fmt_ms(timing.acquisition_ms), _fmt_ms(timing.queue_wait_ms),
         _fmt_ms(timing.bgr_convert_ms), _fmt_ms(timing.inspect_ms),
@@ -2708,7 +2737,16 @@ def log_frame_timing(name: str, timing: FrameTiming, res: InspectResult) -> None
         _fmt_ms(timing.rx_first_to_decision_ms), _fmt_ms(timing.rx_first_to_control_ms),
         _fmt_ms(timing.rx_first_to_full_ms), _fmt_ms(timing.deadline_margin_ms),
         timing.queue_depth if timing.queue_depth is not None else "-")
-    stages = " ".join("%s=%.2fms" % item for item in res.timings_ms.items())
+    # 阶段名用中文，一行汇总；#序号 CAM编号 判定 总耗时 | 各阶段ms。
+    stages = " ".join("%s%.1f" % (_STAGE_CN.get(k, k), v)
+                      for k, v in res.timings_ms.items()
+                      if k not in ("inspect_total", "inspect_ms"))  # 总耗时已单列，不重复
+    # 末尾补一个换行 -> 帧与帧之间空一行(--timing 模式本行是该帧末行)。
+    RUNTIME_LOGGER.info("[TIMING-INSPECT] #%s %s  判定%s  %.1fms | %s\n",
+                        timing.frame_id if timing.frame_id is not None else "-",
+                        _short_name(name), "OK" if res.is_ok else "NG",
+                        res.elapsed_ms, stages or "无阶段")
+    # 每孔明细太长，降到 DEBUG（--debug 才印），日常 --timing 只看上面这一行。
     detail_parts = []
     for key, value in res.timing_details.items():
         if isinstance(value, dict):
@@ -2716,8 +2754,9 @@ def log_frame_timing(name: str, timing: FrameTiming, res: InspectResult) -> None
                 key, ",".join("%s=%.2fms" % item for item in value.items())))
         else:
             detail_parts.append("%s=%s" % (key, value))
-    RUNTIME_LOGGER.info("[TIMING-INSPECT] image=%s %s %s",
-                        name, stages or "no-stages", " ".join(detail_parts))
+    if detail_parts:
+        RUNTIME_LOGGER.debug("[TIMING-INSPECT-HOLES] %s %s",
+                             _short_name(name), " ".join(detail_parts))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2805,32 +2844,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_ok = n_ng = n_bad = n_control_late = n_uno_fail = n_plc_fail = n_no_actuator = 0
     n_timeout = n_timeout_backlog = n_timeout_algo = 0  # 超时 NG 与其两种根因
     consecutive_timeouts = 0  # 连续超时计数，达到 TIMEOUT_ESCALATE_N 升级停线
+    frame_seq = 0  # 运行序号(文件夹源无 frame_id 时给逐帧日志一个 #编号)
     hit = miss = 0
     timing_stats = TimingStats()
     saver = AsyncImageSaver()  # 存图交后台线程异步执行，不占检测耗时/不推迟喷嘴
     t_start = time.time()
     exit_code = 0
 
-    def emit_control(is_ok: bool, image_name: str, tag: str) -> Tuple[Optional[float], float]:
-        """判定一出立刻吹气/报 PLC（关键路径），返回 (uno_ms, plc_ms)。"""
+    def emit_control(is_ok: bool, image_name: str, tag: str
+                     ) -> Tuple[Optional[float], float, str]:
+        """判定一出立刻吹气/报 PLC（关键路径），返回 (uno_ms, plc_ms, uno_status)。
+        uno_status: ""=OK无需吹 / "已吹气" / "吹气失败" / "无UNO未吹"，用于逐帧日志。"""
         nonlocal n_uno_fail, n_no_actuator, n_plc_fail
         uno_ms: Optional[float] = None
+        uno_status = ""
         if not is_ok:
             if uno is not None:
                 uno_t0 = time.perf_counter()
-                if not uno.pulse():
+                if uno.pulse():
+                    uno_status = "已吹气"
+                else:
                     n_uno_fail += 1
+                    uno_status = "吹气失败"
                     RUNTIME_LOGGER.error("[IO-ERROR] image=%s %s 脉冲发送失败", image_name, tag)
                 uno_ms = (time.perf_counter() - uno_t0) * 1000.0
             else:
                 n_no_actuator += 1  # NG 但无 UNO：漏吹，必须在汇总里暴露
+                uno_status = "无UNO未吹"
         plc_t0 = time.perf_counter()
         try:
             plc.report(is_ok)
         except Exception as exc:  # noqa: BLE001
             n_plc_fail += 1
             RUNTIME_LOGGER.error("[IO-ERROR] image=%s PLC 上报失败: %s", image_name, exc)
-        return uno_ms, (time.perf_counter() - plc_t0) * 1000.0
+        return uno_ms, (time.perf_counter() - plc_t0) * 1000.0, uno_status
 
     def log_timeout_ng(cause: str, frame_id, camera_name: str, enqueued_wall,
                        queue_wait_ms, inspect_ms, window_ms, raw_verdict: str) -> None:
@@ -2854,14 +2901,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_timing = getattr(source, "current_frame_timing", None)
             timing = replace(source_timing) if isinstance(source_timing, FrameTiming) else FrameTiming()
             frame_started_at = getattr(source, "current_frame_started_at", None)
-            # 每帧开头打一条分隔线，肉眼一眼分清上一件结束/下一件开始（含超时/积压/无效帧）。
-            RUNTIME_LOGGER.info(
-                "======== 帧 #%s %s ========",
-                timing.frame_id if timing.frame_id is not None else "?", name)
+            frame_seq += 1
+            if timing.frame_id is None:  # 文件夹源无 frame_id: 用运行序号, 令各行 #编号一致
+                timing.frame_id = frame_seq
+            frame_no = timing.frame_id
+            # 帧分隔线降到 DEBUG：日常一帧一行看 [INSPECT-DONE] 即可；排查时 --debug 才需要它。
+            RUNTIME_LOGGER.debug("======== 帧 #%s %s ========", frame_no, name)
             if bgr is None:
                 n_bad += 1
                 RUNTIME_LOGGER.warning("[FRAME-INVALID] %s，按 NG 处理", name)
-                timing.uno_ms, timing.plc_ms = emit_control(False, name, "无效帧 NG")
+                timing.uno_ms, timing.plc_ms, _uno_st = emit_control(False, name, "无效帧 NG")
                 timing.raw_verdict = timing.effective_verdict = NG_INVALID_FRAME
                 n_ng += 1
                 consecutive_timeouts = 0  # 无效帧不是超时，重置连续超时
@@ -2894,7 +2943,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timing.late = True
                     timing.raw_verdict = "(skipped)"
                     timing.effective_verdict = TIMEOUT_NG
-                    timing.uno_ms, timing.plc_ms = emit_control(False, name, "超时 NG")
+                    timing.uno_ms, timing.plc_ms, _uno_st = emit_control(False, name, "超时 NG")
                     n_timeout += 1
                     n_timeout_backlog += 1
                     n_ng += 1
@@ -2912,7 +2961,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     continue
 
             queue_text = _fmt_ms(timing.queue_wait_ms)
-            RUNTIME_LOGGER.info("[INSPECT-START] image=%s queue_wait=%sms", name, queue_text)
+            # 开始行降到 DEBUG：日常只看一行 [INSPECT-DONE]；排查卡顿时 --debug 才需要“正在处理哪帧”。
+            RUNTIME_LOGGER.debug("[INSPECT-START] image=%s queue_wait=%sms", name, queue_text)
             if args.calib:
                 calibrate(bgr, name)
                 continue
@@ -2939,7 +2989,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             timing.effective_verdict = res.verdict
 
             # 控制关键路径：判定一出立刻吹气/报 PLC，日志与存图全部后置。
-            timing.uno_ms, timing.plc_ms = emit_control(res.is_ok, name, "NG")
+            timing.uno_ms, timing.plc_ms, uno_status = emit_control(res.is_ok, name, "NG")
             control_done_at = time.perf_counter()
             if frame_started_at is not None:
                 timing.rx_first_to_control_ms = max(
@@ -2957,8 +3007,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                timing.queue_wait_ms, res.elapsed_ms, window_ms, timeout_raw_verdict)
             else:
                 consecutive_timeouts = 0  # 正常判定归零连续超时
-            RUNTIME_LOGGER.info("[INSPECT-DONE] image=%s raw=%s effective=%s elapsed=%.1fms",
-                                res.name, timing.raw_verdict, res.verdict, res.elapsed_ms)
+            # 一帧一行：#序号 CAM编号 判定 耗时 队列；NG 再带吹气状态与简短原因。
+            # 帧间空一行分隔：非 --timing 时本行是该帧末行，行尾补一个换行；--timing 时空行留给
+            # 后面的 [TIMING-INSPECT] 末行去补(见 log_frame_timing)，这里不补免得空在中间。
+            sep = "" if args.timing else "\n"
+            if res.is_ok:
+                RUNTIME_LOGGER.info("[INSPECT-DONE] #%s %s  判定 OK  耗时 %.1fms  队列 %sms%s",
+                                    frame_no, _short_name(name), res.elapsed_ms, queue_text, sep)
+            else:
+                RUNTIME_LOGGER.info("[INSPECT-DONE] #%s %s  判定 NG  耗时 %.1fms  队列 %sms  [%s]  %s%s",
+                                    frame_no, _short_name(name), res.elapsed_ms, queue_text,
+                                    uno_status or "未知", res.reason, sep)
             if res.verdict in (NG_PART_NOT_FOUND, NG_HOLE_NOT_FOUND):
                 RUNTIME_LOGGER.warning("[LOCATE] method=%s verdict=%s reason=%s",
                                        res.locate_method, res.verdict, res.reason)
