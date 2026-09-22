@@ -1,12 +1,17 @@
 
+import os
+import sys
+
 import serial
 import time
 
 # =========================
 # Arduino 串口配置
 # =========================
-PORT = "COM7"
-BAUDRATE = 115200
+# 串口/波特率从唯一定义源 uno_relay.py 取，别在这里再抄一份(防漂移)。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "src", "flange_inspect"))
+from uno_relay import COM_PORT as PORT, BAUD_RATE as BAUDRATE
 
 try:
     arduino = serial.Serial(

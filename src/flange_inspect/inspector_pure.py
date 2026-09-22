@@ -329,10 +329,10 @@ PLC_REG_HEARTBEAT = 101  # 心跳寄存器
 
 # ---------- 11. Arduino UNO PLC对接 ----------
 ENABLE_UNO = True  # UNO 执行器总开关: 电脑无法直接输出 0V 信号, 由 UNO 对接 PLC, PLC 再驱动电磁阀吹 NG 件
-UNO_PORT = "COM7"  # Arduino UNO 的串口号(Windows 设备管理器里看); 换机器多半要改这里
-UNO_PIN = 8  # Arduino UNO 输出引脚，当前接 PLC X12
-UNO_BAUDRATE = 115200  # 必须与uno_relay.py.py/Arduino uno_plc_trigger.ino 一致
-UNO_PULSE_SECONDS = 0.05  # UNO 固定NG脉冲时间，仅用于日志
+# UNO 串口/引脚/波特率的唯一定义在 uno_relay.py(COM_PORT / UNO_PIN / BAUD_RATE)，
+# 现场换机器改 COM 口只改那一处；此处不再重复以防像 inspector_cpp 旧版那样各自漂移。
+# 下面实例化 UnoRelayController 时不传这三项，直接用 uno_relay 的默认值。
+# (脉宽不在此设：实际由固件 uno_plc_trigger.ino 的 PULSE_MS 决定，主机侧调不了。)
 
 # =====================================================================================
 # ==============================  以下为业务逻辑, 现场无需改动  ==========================
@@ -2290,13 +2290,21 @@ def inspect(bgr: np.ndarray, name: str = "", timing: bool = False) -> Tuple[Insp
 
     feature_a_total = feature_b_total = 0.0
     for hole in holes[:n_check]:
-        hole_t0 = time.perf_counter()
-        raw_cnt, ring_cnt, ring_radii = feature_a_ring_contours(gray, hole.cx, hole.cy, hole.r)
-        hole.raw_contour_count = raw_cnt
-        hole.ring_count = ring_cnt
-        hole.ring_radii = ring_radii
-        contour_ms = (time.perf_counter() - hole_t0) * 1000.0
-        a_contour = ring_cnt >= RING_COUNT_MIN
+        # contour 分支 ~3.2ms/孔, 是全帧最贵的诊断项之一。hough 模式下它不进判定
+        # (只读 a_hough), 只用于 --debug 打印与叠加图环标注。所以纯 hough 且不 debug 时
+        # 直接跳过 -> 每帧省 ~25ms, 判定 100% 不变(a_contour 在这种情况下永不被读)。
+        # 判定真要用 contour 的模式(contour/contour_and_hough/contour_or_hough)照算不省。
+        need_contour = PRINT_DEBUG or FEATURE_A_MODE != "hough"
+        a_contour = False
+        contour_ms = 0.0
+        if need_contour:
+            hole_t0 = time.perf_counter()
+            raw_cnt, ring_cnt, ring_radii = feature_a_ring_contours(gray, hole.cx, hole.cy, hole.r)
+            hole.raw_contour_count = raw_cnt
+            hole.ring_count = ring_cnt
+            hole.ring_radii = ring_radii
+            contour_ms = (time.perf_counter() - hole_t0) * 1000.0
+            a_contour = ring_cnt >= RING_COUNT_MIN
         a_hough = False
         hough_ms = 0.0
         if FEATURE_A_MODE != "contour":
@@ -2985,12 +2993,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             # 文件名含中文，但 Python 允许导入中文模块名。
             from uno_relay import UnoRelayController
-            uno = UnoRelayController(
-                port=UNO_PORT,
-                pin=UNO_PIN,
-                baudrate=UNO_BAUDRATE,
-                pulse_seconds=UNO_PULSE_SECONDS,
-            )
+            # 串口/引脚/波特率不再显式传入，走 uno_relay.py 里的默认值
+            # (COM_PORT / UNO_PIN / BAUD_RATE)——单一同源，改一处全生效。
+            uno = UnoRelayController()
             if not uno.connect():
                 print("[WARN] UNO 未连接，视觉检测继续运行，但 NG 不会驱动电磁阀")
                 uno = None
