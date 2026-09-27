@@ -26,7 +26,7 @@ from serial.tools import list_ports
 #   BAUD_RATE 若改了，固件那行必须手动跟着改，否则串口乱码。
 # COM_PORT 填具体串口(如 "COM7") = 显式优先，连不上会自动回退探测 CH340(自愈)；
 #   填 "AUTO" = 直接自动探测 CH340 挂在哪个 COM。逻辑见 find_ch340_ports() / connect()。
-COM_PORT = "COM7"
+COM_PORT = "Auto"
 UNO_PIN = 8
 BAUD_RATE = 115200
 SERIAL_TIMEOUT = 0.20
