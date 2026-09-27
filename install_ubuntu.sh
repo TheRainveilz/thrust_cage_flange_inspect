@@ -7,7 +7,7 @@
 #      也要 libGL/glib, 否则报 libGL.so.1 找不到) + git-lfs(datasets 是 LFS 素材)
 #   2) 依赖安装: 优先 uv 按 uv.lock 复现锁定环境(numpy/opencv 版本与 Windows 完全一致);
 #      装不上 uv 时退回 python3 venv + pip 按 requirements.txt(opencv 版本仍精确 pin)
-#   3) 结果统一落在项目根 .venv/ , 之后用 ./run_inspector.sh 启动
+#   3) 结果统一落在项目根 venv/ , 之后用 ./run_inspector.sh 启动
 #
 # 用法:
 #   bash install_ubuntu.sh            # 核心 + http + plc 全装
@@ -40,6 +40,9 @@ else
 fi
 
 # 2) 依赖: 优先 uv -----------------------------------------------------------
+# 环境目录统一叫 venv/(无点), 与 run_inspector.sh 和现场 Ubuntu 一致。
+# uv 默认建 .venv, 用此环境变量改到 venv, 保证 uv / pip 两条路径都落同一个目录。
+export UV_PROJECT_ENVIRONMENT="$ROOT/venv"
 UV="$(command -v uv || true)"
 if [ -z "$UV" ]; then
   log "未检测到 uv, 尝试安装(Astral 官方脚本, 只装到用户目录, 不动系统 python)..."
@@ -55,20 +58,20 @@ if [ -n "$UV" ] && [ -f pyproject.toml ]; then
   else "$UV" sync --extra http --extra plc; fi
 else
   log "无 uv, 退回 venv + pip(opencv 版本仍按 requirements.txt 精确 pin)..."
-  [ -d .venv ] || python3 -m venv .venv
-  ./.venv/bin/python -m pip install --upgrade pip
+  [ -d venv ] || python3 -m venv venv
+  ./venv/bin/python -m pip install --upgrade pip
   if [ "$CORE_ONLY" = "1" ]; then
-    ./.venv/bin/python -m pip install "numpy>=2.4.6" "opencv-python==4.14.0.94" "pyserial>=3.5"
+    ./venv/bin/python -m pip install "numpy>=2.4.6" "opencv-python==4.14.0.94" "pyserial>=3.5"
   else
-    ./.venv/bin/python -m pip install -r requirements.txt
+    ./venv/bin/python -m pip install -r requirements.txt
   fi
 fi
 
-[ -x "$ROOT/.venv/bin/python" ] || die "安装后仍找不到 .venv/bin/python, 请看上方日志"
+[ -x "$ROOT/venv/bin/python" ] || die "安装后仍找不到 venv/bin/python, 请看上方日志"
 
 # 3) 冒烟自检 ----------------------------------------------------------------
 log "自检 import numpy / cv2 / serial ..."
-./.venv/bin/python - <<'PY'
+./venv/bin/python - <<'PY'
 import numpy, cv2, serial
 print("[OK] numpy %s | opencv %s | pyserial %s"
       % (numpy.__version__, cv2.__version__, serial.__version__))
@@ -76,7 +79,7 @@ PY
 
 cat <<EOF
 
-[完成] 依赖已装到 .venv/  (解释器: $ROOT/.venv/bin/python)
+[完成] 依赖已装到 venv/  (解释器: $ROOT/venv/bin/python)
 启动:  ./run_inspector.sh              # 默认相机模式(产线)
        ./run_inspector.sh --mode local # 离线跑本地样本目录做验证
 

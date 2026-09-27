@@ -18,8 +18,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-PY="$ROOT/venv/bin/python"
-[ -x "$PY" ] || { echo "[ERROR] 没找到 venv/bin/python, 先执行: bash install_ubuntu.sh" >&2; exit 1; }
+# venv 解释器: 现场 Ubuntu 与 install_ubuntu.sh 统一用 venv/(无点), 优先它;
+# 万一是老现场手建的 .venv/(有点)则回退。两个都没有才报错。
+if [ -x "$ROOT/venv/bin/python" ]; then
+  PY="$ROOT/venv/bin/python"
+elif [ -x "$ROOT/.venv/bin/python" ]; then
+  PY="$ROOT/.venv/bin/python"
+else
+  echo "[ERROR] 没找到 venv/bin/python(也没有 .venv/bin/python), 先执行: bash install_ubuntu.sh" >&2
+  exit 1
+fi
 
 # 中文日志防乱码(Linux 默认多为 UTF-8, 显式设置以防 C/POSIX locale 编码报错)
 export PYTHONUTF8=1
