@@ -287,8 +287,10 @@ PART_MIN_MARKED_HOLES = 4
 
 # ---------- 9. 调试 / 存图 ----------
 PRINT_DEBUG = True  # 打印每孔轮廓计数、有效压痕数、判定结果
-SAVE_NG_IMAGE = True  # NG 样本本地保存
-SAVE_OK_IMAGE = False  # OK 样本也保存(追溯用)
+SAVE_NG_IMAGE = False  # 默认不存结果图(长期运行/产线不刷盘); --debug 存 NG+OK, 采样标志(--collect/
+#   --save-ok/--save-dir/--no-overlay/--save-ext)按需打开。注意: 产线 NG 留证靠 RAW(见 SAVE_RAW_IMAGE,
+#   相机模式帧组装时无损落盘), 与这里的"结果图/叠加图"是两回事 —— 关掉结果图不影响 RAW 留证。
+SAVE_OK_IMAGE = False  # OK 样本也保存(追溯用); --debug 或 --save-ok 时打开
 SAVE_OVERLAY = True  # 保存时叠加检测结果(孔/ROI/拐角/环) 便于现场看图排查
 # ⚠ 采样标阈值时必须关掉(命令行 --no-overlay / --collect):
 #   dbg_report 会去分析图上的线条, 存叠加图等于喂错数据
@@ -622,17 +624,38 @@ def fit_circle_ransac(pts: np.ndarray, iters: int, tol_ratio: float, tol_min: fl
         rng = np.random.default_rng(20260921)
         sel = rng.choice(len(combos), max_combos, replace=False)
         combos = [combos[i] for i in sel]
-    best = None
-    for tri in combos:
-        cx, cy, r = fit_circle_lsq(pts[list(tri)])
-        if not np.isfinite((cx, cy, r)).all() or r <= r_floor:
-            continue
-        k = count_circle_inliers(pts, cx, cy, r, tol_ratio, tol_min)
-        if best is None or k > best[3]:
-            best = (cx, cy, r, k)
-    if best is None or best[3] < min_pts:
+    # 向量化候选评估(2026-09-27): 原来是逐 3 点子集的 Python 循环(每次 fit_circle_lsq +
+    # count_circle_inliers), 候选点多时 4000 组合要跑满 -> 生产 max 定位 352ms 的尾巴。这里
+    # 用闭式外接圆(3 点时与 Kasa lsq 代数等价)+ 整块内点计数一次算完所有组合, 语义逐条对齐:
+    #   * 无效组合(退化/非有限/r<=r_floor)记 k=-1 剔除, 与原 `continue` 一致;
+    #   * argmax 取首个最大 k, 与原 `k > best[3]` 严格大于(保留先到者)一致;
+    #   * 胜出组合再用原 fit_circle_lsq 重算种子, 使进入下面共识重拟合的 (cx,cy,r) 逐位一致。
+    # 判定契约不变(过 --sweep 全量保真), 见 _diag_ransac_vec 原型: 26~33x 且判定 0 不一致。
+    tri_idx = np.asarray(combos, dtype=np.intp)      # (M,3)
+    P = pts[tri_idx]                                 # (M,3,2)
+    ax, ay = P[:, 0, 0], P[:, 0, 1]
+    bx, by = P[:, 1, 0], P[:, 1, 1]
+    cx3, cy3 = P[:, 2, 0], P[:, 2, 1]
+    det = 2.0 * (ax * (by - cy3) + bx * (cy3 - ay) + cx3 * (ay - by))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sa = ax * ax + ay * ay
+        sb = bx * bx + by * by
+        sc = cx3 * cx3 + cy3 * cy3
+        ccx = (sa * (by - cy3) + sb * (cy3 - ay) + sc * (ay - by)) / det
+        ccy = (sa * (cx3 - bx) + sb * (ax - cx3) + sc * (bx - ax)) / det
+        ccr = np.hypot(ccx - ax, ccy - ay)
+    valid = np.isfinite(ccx) & np.isfinite(ccy) & np.isfinite(ccr) & (ccr > r_floor)
+    # 每个候选圆的真实内点数(容差与 count_circle_inliers 完全一致: 逐候选 max(ratio*r, min), 严格 <)
+    dist = np.hypot(pts[:, 0][None, :] - ccx[:, None], pts[:, 1][None, :] - ccy[:, None])  # (M,n)
+    tol_m = np.maximum(tol_ratio * ccr, tol_min)
+    kcnt = (np.abs(dist - ccr[:, None]) < tol_m[:, None]).sum(axis=1)
+    kcnt = np.where(valid, kcnt, -1)
+    if int(kcnt.max()) < 0:
         return None
-    cx, cy, r, _ = best
+    bi = int(np.argmax(kcnt))        # 首个达到最大 k 的候选(等价原循环保留先到者)
+    if int(kcnt[bi]) < min_pts:
+        return None
+    cx, cy, r = fit_circle_lsq(pts[list(combos[bi])])  # 用原 lsq 重算胜出种子, 逐位对齐
     for _ in range(max(1, iters)):  # 共识集上迭代重拟合(收敛到所有内点的最小二乘解)
         keep = (np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r)
                 < max(tol_ratio * r, tol_min))
@@ -2918,7 +2941,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                     default=CAM_TRIGGER_ORDER,
                     help="camera 模式的触发方式: external=IO 外部硬触发(上线, 被动等帧), "
                          "MainRunOnce=软触发(台上调试), ContinuousImageCapture=连续预览(调光)")
-    ap.add_argument("--debug", action="store_true", help="额外保存叠加调试图(OK 也存)")
+    ap.add_argument("--debug", action="store_true", help="调试模式: 存图(NG+OK, 叠加检测结果) + 日志级别 DEBUG(逐帧明细)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="静默控制台: 日志只写文件(内容仍完整), 控制台只留 WARNING+ 与启动提示; "
+                         "长期运行用, 不刷屏也不会因终端慢卡住检测线程")
     ap.add_argument("--timing", action="store_true",
                     help="输出取图、排队、算法内部、UNO/PLC和存图的详细耗时")
     ap.add_argument("--save-ok", dest="save_ok", action="store_true",
@@ -3013,11 +3039,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     setup_console()
     setup_runtime_logging()
     args = parse_args(argv)
-    global SAVE_OK_IMAGE, HOLE_CHECK_COUNT, CAM_TRIGGER_ORDER, CAM_MAX_FRAMES
+    global SAVE_OK_IMAGE, SAVE_NG_IMAGE, HOLE_CHECK_COUNT, CAM_TRIGGER_ORDER, CAM_MAX_FRAMES
     global SAVE_OVERLAY, SAVE_IMAGE_EXT, OK_SAVE_DIR, NG_SAVE_DIR
+    if args.quiet:
+        # 长期运行: 把控制台 handler 抬到 WARNING(仅错误/超时/断链等才冒到屏上), 逐帧 INFO 只进文件;
+        # 文件 handler 不动, 日志内容依旧完整。也避免终端慢时 StreamHandler 阻塞主检测线程。
+        for _h in RUNTIME_LOGGER.handlers:
+            if getattr(_h, "stream", None) is sys.stdout:
+                _h.setLevel(logging.WARNING)
+        print("[日志] 控制台已静默(仅 WARNING+), 完整日志写入: %s" % RUNTIME_LOG_DIR)
     if args.debug or args.save_ok:
         SAVE_OK_IMAGE = True
     if args.debug:
+        SAVE_NG_IMAGE = True  # --debug: NG+OK 都存(叠加图, 供排查看)
         # --debug 才把日志级别降到 DEBUG：让平时降噪隐藏的逐帧明细(INSPECT-START/RESULT-SAVED/
         # 帧分隔线/每孔耗时)重新打出来，排查时用。默认(INFO)只保留一帧一行的 [INSPECT-DONE]。
         RUNTIME_LOGGER.setLevel(logging.DEBUG)
@@ -3053,6 +3087,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         global RAW_SAVE_DIR
         RAW_SAVE_DIR = os.path.join(save_root, "RAW")
     if args.collect or args.no_overlay or args.save_ok or args.save_ext or save_root:
+        SAVE_NG_IMAGE = True  # 显式给了存图相关标志(采样/换目录/换格式) → 打开 NG 存图
         where = (os.path.join(os.path.abspath(save_root), "{OK,NG}") if save_root
                  else "%s + %s" % (OK_SAVE_DIR, NG_SAVE_DIR))
         print("[INFO] 存图 %s | 格式 %s | %s"
