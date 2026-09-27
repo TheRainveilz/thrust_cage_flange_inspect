@@ -1,3 +1,6 @@
 datasets/**/*.jpg filter=lfs diff=lfs merge=lfs -text
 datasets/**/*.jpeg filter=lfs diff=lfs merge=lfs -text
 datasets/**/*.png filter=lfs diff=lfs merge=lfs -text
+
+# shell 脚本强制 LF 行尾: 防 Windows 检出成 CRLF 导致 Ubuntu 上 "bad interpreter: ...^M"
+*.sh text eol=lf
