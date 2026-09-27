@@ -288,8 +288,8 @@ PART_MIN_MARKED_HOLES = 4
 # ---------- 9. 调试 / 存图 ----------
 PRINT_DEBUG = True  # 打印每孔轮廓计数、有效压痕数、判定结果
 SAVE_NG_IMAGE = False  # 默认不存结果图(长期运行/产线不刷盘); --debug 存 NG+OK, 采样标志(--collect/
-#   --save-ok/--save-dir/--no-overlay/--save-ext)按需打开。注意: 产线 NG 留证靠 RAW(见 SAVE_RAW_IMAGE,
-#   相机模式帧组装时无损落盘), 与这里的"结果图/叠加图"是两回事 —— 关掉结果图不影响 RAW 留证。
+#   --save-ok/--save-dir/--no-overlay/--save-ext)按需打开。产线默认「零存图、只留日志」:
+#   结果图(这里)和 RAW(见 SAVE_RAW_IMAGE)都默认关, 只有 --debug 才一起打开; 产线 NG 靠 .log 记录留痕。
 SAVE_OK_IMAGE = False  # OK 样本也保存(追溯用); --debug 或 --save-ok 时打开
 SAVE_OVERLAY = True  # 保存时叠加检测结果(孔/ROI/拐角/环) 便于现场看图排查
 # ⚠ 采样标阈值时必须关掉(命令行 --no-overlay / --collect):
@@ -303,7 +303,8 @@ SAVE_IMAGE_EXT = ".jpg"  # 存图格式: ".jpg"=省空间(走 JPEG_QUALITY) /
 # 命令行 --save-ext / --collect 可覆盖
 RAW_SAVE_EXT = ".png"  # RAW 恒定无损 PNG，与 SAVE_IMAGE_EXT 解耦。RAW 是追溯证据，必须能逐像素
 #   复现产线判定：JPEG 有损压缩在圆度卡阈值(0.75)的临界帧上足以让判定翻面，无法复盘。
-SAVE_RAW_IMAGE = True  # 完整帧无叠加留证；在采集线程内“帧一组装好就存”，与传感器存图一一对齐
+SAVE_RAW_IMAGE = False  # 默认不存 RAW(产线图太多、只留日志)。完整帧无叠加留证, 在采集线程内“帧一组装好就存”、
+#   与传感器存图一一对齐; 仅 --debug 时打开(与结果图一起)。关掉后产线 NG 只在 .log 里留记录, 不落任何图。
 RAW_SAVE_DIR = os.path.join(DEFAULT_DATA_DIR, "RAW")  # RAW 留证默认目录(项目根/data/RAW)；--save-dir 下建 RAW/
 SAVE_QUEUE_SIZE = 64  # 结果图后台存图队列深度；满了丢最旧留档图并计数，绝不阻塞检测线程
 SAVE_JOIN_TIMEOUT_S = 3.0  # 停机时等后台存图线程排空并退出的上限
@@ -3039,7 +3040,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     setup_console()
     setup_runtime_logging()
     args = parse_args(argv)
-    global SAVE_OK_IMAGE, SAVE_NG_IMAGE, HOLE_CHECK_COUNT, CAM_TRIGGER_ORDER, CAM_MAX_FRAMES
+    global SAVE_OK_IMAGE, SAVE_NG_IMAGE, SAVE_RAW_IMAGE, HOLE_CHECK_COUNT, CAM_TRIGGER_ORDER, CAM_MAX_FRAMES
     global SAVE_OVERLAY, SAVE_IMAGE_EXT, OK_SAVE_DIR, NG_SAVE_DIR
     if args.quiet:
         # 长期运行: 把控制台 handler 抬到 WARNING(仅错误/超时/断链等才冒到屏上), 逐帧 INFO 只进文件;
@@ -3052,6 +3053,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         SAVE_OK_IMAGE = True
     if args.debug:
         SAVE_NG_IMAGE = True  # --debug: NG+OK 都存(叠加图, 供排查看)
+        SAVE_RAW_IMAGE = True  # --debug: 连 RAW 也留(相机模式帧组装无损落盘); 产线默认全关、只留日志
         # --debug 才把日志级别降到 DEBUG：让平时降噪隐藏的逐帧明细(INSPECT-START/RESULT-SAVED/
         # 帧分隔线/每孔耗时)重新打出来，排查时用。默认(INFO)只保留一帧一行的 [INSPECT-DONE]。
         RUNTIME_LOGGER.setLevel(logging.DEBUG)
@@ -3308,8 +3310,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     frame_no, _short_name(name), res.elapsed_ms, queue_text,
                                     uno_status or "未知", res.reason, sep)
             if res.verdict in (NG_PART_NOT_FOUND, NG_HOLE_NOT_FOUND):
-                RUNTIME_LOGGER.warning("[LOCATE] method=%s verdict=%s reason=%s",
-                                       res.locate_method, res.verdict, res.reason)
+                # 定位失败判 NG 是**正常 NG 结局**(反面/残件/漏冲件本就定不出节圆), 长期运行会很多,
+                # 故用 INFO 不用 WARNING: --quiet 下它随逐帧明细一起只进 .log、不刷控制台;
+                # 上面的 [INSPECT-DONE] 已按帧记了判定+原因, 这行只是把 locate 方法单独拎出便于 grep。
+                RUNTIME_LOGGER.info("[LOCATE] method=%s verdict=%s reason=%s",
+                                    res.locate_method, res.verdict, res.reason)
             if PRINT_DEBUG:
                 print_result(res)
             if timing.control_late:
