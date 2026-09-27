@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""批量统计视觉算法的特征 A / 特征 B 通过率（纯 Py 与 C++ 加速版合一）。
+"""批量统计视觉算法的特征 A / 特征 B 通过率（纯 Py 版）。
 
-用 --impl 选择实现，两版算法共用同一套统计逻辑：
-    python tools/analyze_feature_ab.py --impl pure --dir "D:\\zq\\imageData" --holes 0
-    python tools/analyze_feature_ab.py --impl cpp  --dir "D:\\zq\\imageData" --holes 0
+只跑 inspector_pure（C++ 加速版 inspector_cpp 已从仓库移除）：
+    python tools/analyze_feature_ab.py --dir "D:\\zq\\imageData" --holes 0
 
 CSV 输出：
     不传 --csv 时，自动写到 --outdir(默认 artifacts/reports/)，
@@ -41,14 +40,9 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 DEFAULT_OUTDIR = os.path.join(_REPO_ROOT, "artifacts", "reports")
 
 
-def load_impl(impl: str):
-    """按 --impl 返回对应算法模块(纯 Py 或 C++ 加速版)。"""
-    if impl == "cpp":
-        from src.flange_inspect import inspector_cpp as T
-    elif impl == "pure":
-        from src.flange_inspect import inspector_pure as T
-    else:
-        raise ValueError("--impl 只能是 pure 或 cpp: %r" % impl)
+def load_impl(impl: str = "pure"):
+    """返回纯 Py 算法模块 inspector_pure(C++ 版 inspector_cpp 已移除, 只保留 pure)。"""
+    from src.flange_inspect import inspector_pure as T
     return T
 
 
@@ -75,8 +69,8 @@ class ImageStat:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="统计视觉检测特征 A/B 通过率")
-    ap.add_argument("--impl", choices=("pure", "cpp"), default="pure",
-                    help="算法实现: pure=纯 Python, cpp=C++ 加速版(默认 pure)")
+    ap.add_argument("--impl", choices=("pure",), default="pure",
+                    help="算法实现: 仅 pure=纯 Python(C++ 加速版已从仓库移除)")
     ap.add_argument("--dir", required=True, help="图片目录，支持 OK/NG 子目录")
     ap.add_argument("--csv", default=None,
                     help="输出逐图 CSV 完整路径；不传则按 --outdir 自动命名")
@@ -86,8 +80,7 @@ def parse_args() -> argparse.Namespace:
                     help="参与统计的孔数；0=全部孔；默认使用主程序当前配置")
     ap.add_argument("--limit", type=int, default=0, help="最多处理多少张；0=全部")
     ap.add_argument("--no-pitch-gate", action="store_true",
-                    help="关掉节圆前置闸(HOLE_PITCH_GATE=False)，用于复现闸前基线做对照；"
-                         "仅 pure 实现有该开关")
+                    help="关掉节圆前置闸(HOLE_PITCH_GATE=False)，用于复现闸前基线做对照")
     ap.add_argument("--feature-a-mode", default=None,
                     choices=("contour", "hough", "contour_or_hough", "contour_and_hough"),
                     help="覆盖 FEATURE_A_MODE，决定特征A用哪个分支；默认用模块当前值")
