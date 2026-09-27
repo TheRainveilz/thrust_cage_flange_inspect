@@ -107,7 +107,7 @@ CAM_VALIDATE_RECORD_CHECKSUM = False  # B 方案(2026-09-20 关, 可回退)：�
 CAM_TCP_NODELAY = True  # B 方案(可回退)：关 Nagle, 主要影响我方 ACK 及时性, 近乎零成本。回退: 设 False。
 CAM_RX_PROBE = True  # A 方案(可回退)：RX 探针。统计 recv 最大间隔(GIL 被 inspect 饿死的直接证据),
 #   在 [SUMMARY] 打 rx_gap_max_ms / rx_recv_calls。定位"接收慢"是 CPU 还是 GIL 用, 稳定后可设 False。
-RESULT_DEADLINE_MS = 250.0  # 超时预算：图像入队 → 算法判定（含排队+BGR+inspect，不含网络取图/存图 IO）；须按现场速度/喷嘴距离实测修订
+RESULT_DEADLINE_MS = 300.0  # 超时预算：图像入队 → 算法判定（含排队+BGR+inspect，不含网络取图/存图 IO）；须按现场速度/喷嘴距离实测修订
 TIMEOUT_ESCALATE_N = 15  # 连续超时达到该次数升级停线；0=永不自动停(纯 fail-safe)
 TIMING_RECENT_WINDOW = 200  # p95 只统计最近这些帧，避免长期运行内存增长
 
