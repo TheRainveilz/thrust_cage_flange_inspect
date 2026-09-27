@@ -96,6 +96,7 @@ CAM_IMG_H = 800  # 期望帧高; 实收字节数不符时按本高度反推宽�
 CAM_INTERVAL_S = 0.0  # 仅软触发有效: 两帧之间的间隔(s); 0=判完立刻触发下一帧
 CAM_MAX_FRAMES = 0  # 0 = 无限(上线用); >0 = 取够就退出(调试用)
 CAM_RECONNECT_TRY = 3  # 断链后的重连次数
+CAM_STARTUP_WAIT_S = 30.0  # 启动建链等待窗口(s): 相机刚上电其 10001 服务未就绪时, 在此窗口内反复重试连接; <=0=只试一次(旧行为)
 CAM_FRAME_TIMEOUT_S = 2.0  # 已收到 seq=0 后，整帧必须在该时间内收完
 CAM_QUEUE_SIZE = 8  # 完整帧缓冲深度：吸收连续 NG 时 UNO 串口等待造成的短时积压；配合出队过期预筛，正常填不满
 CAM_SOCKET_RCVBUF = 8 * 1024 * 1024  # 仅吸收 TCP 抖动；不能作为工件安全积压队列
@@ -1059,7 +1060,7 @@ class Vn2000Source:
         # RAW 存图器必须在 RX 线程之前建好，确保第一帧就能落盘，与传感器张数对齐。
         self._raw_saver: Optional["RawFrameSaver"] = (
             RawFrameSaver() if (SAVE_RAW_IMAGE and RAW_SAVE_ON_ASSEMBLY) else None)
-        self._open_socket()
+        self._connect_at_startup()
         self._reconnect_needed.clear()
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat, name="vn2000-heartbeat", daemon=True)
@@ -1100,6 +1101,29 @@ class Vn2000Source:
         return cls._order(CAM_TRIGGER_ORDER)
 
     # ---------- 连接 ----------
+    def _connect_at_startup(self) -> None:
+        """启动建链: 相机刚上电时其 10001 端口 TCP 服务可能尚未就绪, connect 会被拒或超时。
+        在 CAM_STARTUP_WAIT_S 窗口内反复重试, 让"开相机后立刻启动上位机"不再直接失败;
+        窗口内始终连不上才抛出(此时才是真没插网线 / IP 不对 / 相机没开)。
+        CAM_STARTUP_WAIT_S<=0 时退化为只试一次(旧行为)。断链后的重连仍走 _reopen_socket。"""
+        deadline = time.monotonic() + max(0.0, CAM_STARTUP_WAIT_S)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self._open_socket()
+                if attempt > 1:
+                    RUNTIME_LOGGER.info("[ACQ-CONNECT] 启动重试第 %d 次成功", attempt)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise  # 窗口耗尽仍连不上: 抛给调用方, 按真故障处理
+                if attempt == 1:
+                    RUNTIME_LOGGER.warning(
+                        "[ACQ-CONNECT] 相机暂未就绪(%s), 在 %.0fs 内重试建链...",
+                        exc, CAM_STARTUP_WAIT_S)
+                time.sleep(0.5)
+
     def _open_socket(self) -> None:
         """只建立 socket；线程生命周期由 __init__/close 统一管理。"""
         sock = socket.socket()
@@ -1574,6 +1598,63 @@ class Vn2000Source:
             self.processed_frames += 1
             if CAM_INTERVAL_S > 0 and not self._is_external():
                 time.sleep(CAM_INTERVAL_S)
+
+
+def discover_camera_ip(port: int = CAMERA_PORT, timeout: float = 0.15,
+                       workers: int = 64) -> Optional[str]:
+    """在本机 link-local(169.254.x.x)网卡的 /24 段内并发探测哪台主机开着 `port`。
+    相机直连是点对点网段, 正常只有它一个对端, 故"唯一应答者"即相机; 找到 0 个或 >1 个
+    都返回 None(不敢猜, 交上层回退)。纯标准库, 仅在 camera/http 且未显式给 IP 时才调用。"""
+    from concurrent.futures import ThreadPoolExecutor
+    # 借内置默认 IP 探路: UDP connect 不真发包, 只让内核按路由选出本机出口地址,
+    # 从而拿到本机在这块直连网卡上的 link-local 地址(如 169.254.44.200)。
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((CAMERA_IP, 1))
+        local_ip = probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+    if not local_ip.startswith("169.254."):
+        return None  # 本机没有 link-local 直连网卡 -> 扫描无意义, 直接放弃
+    base, local_last = local_ip.rsplit(".", 1)  # ("169.254.44", "200")
+
+    def _alive(host: str) -> Optional[str]:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return host if s.connect_ex((host, port)) == 0 else None
+        except OSError:
+            return None
+        finally:
+            s.close()
+
+    hosts = ["%s.%d" % (base, i) for i in range(1, 255) if str(i) != local_last]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        found = [r for r in pool.map(_alive, hosts) if r]
+    return found[0] if len(found) == 1 else None
+
+
+def resolve_camera_ip(cli_ip: Optional[str], mode: str) -> str:
+    """决定实际连相机用的 IP。优先级(高->低):
+        1) 命令行 --ip 显式指定
+        2) 环境变量 CAMERA_IP(部署时不改码即可覆盖, Win/Linux 通用)
+        3) 同网段自动探测(仅 camera/http; local/watch 不碰网络)
+        4) 头部内置默认常量 CAMERA_IP(兜底, 保证老现场照跑)"""
+    if cli_ip:
+        return cli_ip
+    env = os.environ.get("CAMERA_IP")
+    if env:
+        print("[INFO] 相机 IP 取自环境变量 CAMERA_IP=%s" % env)
+        return env
+    if mode in ("camera", "http"):
+        hit = discover_camera_ip()
+        if hit:
+            print("[INFO] 相机自动识别: %s:%d" % (hit, CAMERA_PORT))
+            return hit
+        print("[INFO] 未自动识别到相机, 回退内置默认 %s" % CAMERA_IP)
+    return CAMERA_IP
 
 
 def build_source(mode: str, folder: str, ip: str):
@@ -2830,7 +2911,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--print-detail", action="store_true", help="打印每孔拐角调试明细(大批量测试关闭，排查样本打开)")
 
     ap.add_argument("--dir", default=LOCAL_IMAGE_DIR, help="本地样本目录 / watch 的监视目录")
-    ap.add_argument("--ip", default=CAMERA_IP, help="相机 IP")
+    ap.add_argument("--ip", default=None,
+                    help="相机 IP; 不指定则自动识别(环境变量 CAMERA_IP -> 同网段探测 -> 内置默认 %s)"
+                         % CAMERA_IP)
     ap.add_argument("--trigger", choices=("external", "MainRunOnce", "ContinuousImageCapture"),
                     default=CAM_TRIGGER_ORDER,
                     help="camera 模式的触发方式: external=IO 外部硬触发(上线, 被动等帧), "
@@ -2988,7 +3071,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "不含网络取图/存图 IO)%s",
             RESULT_DEADLINE_MS, raw_note)
     try:
-        source = build_source(args.mode, args.dir, args.ip)
+        cam_ip = resolve_camera_ip(args.ip, args.mode)
+        source = build_source(args.mode, args.dir, cam_ip)
     except Exception as exc:  # noqa: BLE001
         print("[FATAL] 取图源初始化失败: %s" % exc)
         return 2
