@@ -22,6 +22,9 @@ Environment=PYTHONIOENCODING=UTF-8
 ExecStart=/home/new/dev/thrust_cage_flange_inspect/run_inspector.sh --mode camera --holes 0 --quiet --timing
 Restart=always
 RestartSec=5
+# 日志输出到systemd journal，方便远程排查
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
