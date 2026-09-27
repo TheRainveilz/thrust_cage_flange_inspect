@@ -249,7 +249,7 @@ FEATURE_B_DISABLE_SOFT_ACCEPT = False  # 特征B 兜底开关(可回退)。False
 #   去掉宽松兜底。#128/#444 那类临界压痕就是从这条兜底溜过的; 设 True 可清零该类逃逸但会动召回。回退: 设 False。
 
 # ---------- 8. 判定逻辑 ----------
-HOLE_CHECK_COUNT = 2  # 参与判定的孔数(按质量排序取前 N); 0 = 全部孔
+HOLE_CHECK_COUNT = 0  # 参与判定的孔数(按质量排序取前 N); 0 = 全部孔(产线默认, 黄金基线 318/352 & 反面 623/623 0逃逸就是在全孔下验证的)。>0 仅供快速抽样调试, 会脱离已验证配置, 勿用于产线。
 HOLE_LOGIC = "AND"  # 单孔内 特征A 与 特征B 的组合: "AND"(双特征联合, 勿改) / "OR"
 PART_LOGIC = "OR"  # 孔之间: "OR" = 任一孔满足即 OK (按需求 5)
 PART_MIN_PASS_HOLES = 1  # PART_LOGIC="OR" 下, 需要多少个受检孔同时(A&B)通过才判 OK(可回退)。
@@ -2964,7 +2964,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                     help="存图格式: .jpg=省空间(走 JPEG_QUALITY), .png=无损(采样用)")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 张(本地调试用)")
     ap.add_argument("--holes", type=int, default=None,
-                    help="覆盖 HOLE_CHECK_COUNT: 参与判定的孔数, 0=全部孔(排查用)")
+                    help="覆盖 HOLE_CHECK_COUNT: 参与判定的孔数, 0=全部孔(产线默认)。>0 仅供快速抽样调试, 会脱离已验证配置")
     return ap.parse_args(argv)
 
 
