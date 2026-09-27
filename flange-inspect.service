@@ -1,0 +1,27 @@
+[Unit]
+Description=推力保持架翻边止口检测 (inspector_pure.py 相机模式/产线)
+# 相机是 169.254 link-local 直连网卡, 等网络起来再启动
+After=network-online.target
+Wants=network-online.target
+# 崩溃重启不限次数(产线要一直在), 关掉 systemd 的启动频率熔断
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=new
+# 继电器 UNO 走串口(/dev/ttyUSB0), 需要 dialout 组才能打开
+SupplementaryGroups=dialout
+WorkingDirectory=/home/new/dev/thrust_cage_flange_inspect
+Environment=PYTHONUTF8=1
+Environment=PYTHONIOENCODING=UTF-8
+# 相机 IP 固定时解开下一行(否则脚本按 环境变量->同网段探测->内置默认 自动识别)
+#Environment=CAMERA_IP=169.254.44.201
+# 产线: --holes 0 = 判全部孔(黄金基线 0 逃逸就是在这个配置下验证的, 必带!);
+#       --quiet 控制台只留 WARNING+, 逐帧明细进 .log; 不加 --debug(产线不存图)。
+#       --timing 每帧多打一行耗时明细(--quiet 下只进文件), 监控 250ms 期间建议留着, 不要可删。
+ExecStart=/home/new/dev/thrust_cage_flange_inspect/run_inspector.sh --mode camera --holes 0 --quiet --timing
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
