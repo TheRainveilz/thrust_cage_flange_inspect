@@ -1,5 +1,5 @@
 [Unit]
-Description=推力保持架翻边止口检测 (inspector_pure.py 相机模式/产线)
+Description=推力保持架翻边止口 + 兜孔缺粒检测 (main_pipeline.py 产线主程序, 两站两进程)
 # 相机是 169.254 link-local 直连网卡, 等网络起来再启动
 After=network-online.target
 Wants=network-online.target
@@ -10,16 +10,16 @@ StartLimitIntervalSec=0
 Type=simple
 User=new
 # 继电器 UNO 走串口(/dev/ttyUSB0), 需要 dialout 组才能打开
+# ★ 只有主程序打开串口; 两个检测子进程只经 localhost 报判定, 不碰串口(见 station_link.py)
 SupplementaryGroups=dialout
 WorkingDirectory=/home/new/dev/thrust_cage_flange_inspect
 Environment=PYTHONUTF8=1
 Environment=PYTHONIOENCODING=UTF-8
-# 相机 IP 固定时解开下一行(否则脚本按 环境变量->同网段探测->内置默认 自动识别)
-#Environment=CAMERA_IP=169.254.44.201
-# 产线: --holes 0 = 判全部孔(黄金基线 0 逃逸就是在这个配置下验证的, 必带!);
-#       --quiet 控制台只留 WARNING+, 逐帧明细进 .log; 不加 --debug(产线不存图)。
-#       --timing 每帧多打一行耗时明细(--quiet 下只进文件), 监控 250ms 期间建议留着, 不要可删。
-ExecStart=/home/new/dev/thrust_cage_flange_inspect/run_inspector.sh --mode camera --holes 0 --quiet --timing
+# 两站的相机 IP 由 main_pipeline.py 顶部 STATIONS 显式指定(169.254.44.201 / .202)。
+# 必须是显式的: 两台相机同时在网时 inspector_pure 的自动探测(只认"唯一应答者")必然失败。
+# 产线参数(--mode camera --holes 0 --quiet等)同样在 STATIONS 的 argv 里, 不在这里传,
+# 免得同一份配置在两个地方各写一遍、改一处漏一处。
+ExecStart=/home/new/dev/thrust_cage_flange_inspect/run_pipeline.sh
 Restart=always
 RestartSec=5
 # 日志输出到systemd journal，方便远程排查
