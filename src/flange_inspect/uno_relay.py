@@ -2,17 +2,24 @@
 # -*- coding: utf-8 -*-
 """Arduino UNO 自动控制模块。
 
-与 uno_plc_trigger.ino 使用同一协议（固件为非阻塞短脉冲版）：
+与 uno_plc_trigger.ino 使用同一协议（固件为非阻塞短脉冲版）。**两路独立输出**：
     NG\n      D8 输出一个短触发脉冲(固件 PULSE_MS，默认 50ms)后自动回 LOW；固件立刻回 "NG" ACK
-    OK\n      确保 D8 为 LOW，不触发 PLC；固件回 "OK"
-    STATUS\n  查询 D8 状态
+    NG2\n     D9 同上(第二站/缺粒站)；固件回 "NG2"
+    OK\n      确保 D8/D9 都为 LOW，不触发 PLC；固件回 "OK"
+    OK2\n     只把 D9 拉回 LOW；固件回 "OK2"
+    STATUS\n  查询两路状态
 
+D8 = 第一站(正反面翻边止口)，D9 = 第二站(兜孔缺粒)。两路各自计时、互不阻塞、互不影响。
 电磁阀吹气的延迟/踢除时间由 PLC 自管，UNO 只负责给 PLC 一个干净的触发脉冲。
 固件对 NG/OK 立即 ACK，send() 收到即返回，不再空等 SERIAL_TIMEOUT。
-主程序只在最终判定 NG 时调用 pulse()；OK 不发送指令。
+主程序只在最终判定 NG 时调用 pulse(pin)；OK 不发送指令。
+
+⚠ 一条串口只能有一个主人：两个检测进程不能各自开同一个串口。产线上由主程序
+(main_pipeline.py) 独占本模块并代为吹气，检测进程只上报判定(见 station_link.py)。
 """
 from __future__ import annotations
 
+import sys
 import time
 from typing import Optional
 
@@ -27,7 +34,8 @@ from serial.tools import list_ports
 # COM_PORT 填具体串口(如 "COM7") = 显式优先，连不上会自动回退探测 CH340(自愈)；
 #   填 "AUTO" = 直接自动探测 CH340 挂在哪个 COM。逻辑见 find_ch340_ports() / connect()。
 COM_PORT = "Auto"
-UNO_PIN = 8
+UNO_PIN = 8   # 第一站: 正反面翻边止口(保持原值, 向后兼容)
+UNO_PIN2 = 9  # 第二站: 兜孔缺粒
 BAUD_RATE = 115200
 SERIAL_TIMEOUT = 0.20
 UNO_RESET_WAIT = 1.0
@@ -159,7 +167,7 @@ class UnoRelayController:
         if not self.connected and not self.connect():
             return False
         command = command.strip().upper()
-        if command not in {"NG", "OK", "STATUS"}:
+        if command not in {"NG", "NG2", "OK", "OK2", "STATUS"}:
             print(f"[UNO][ERROR] unsupported command: {command}")
             return False
         try:
@@ -176,13 +184,25 @@ class UnoRelayController:
             print(f"[UNO][ERROR] command {command} failed: {exc}")
             return False
 
-    def pulse(self) -> bool:
-        """发送一次 NG 指令；由 Arduino 输出短触发脉冲(固件 PULSE_MS)并自动回 LOW。"""
-        print(f"[UNO] NG -> D{self.pin} 触发脉冲(脉宽由固件 PULSE_MS 控制)")
-        return self.send("NG")
+    def pulse(self, pin: int = UNO_PIN) -> bool:
+        """给指定引脚发一次 NG 脉冲；由 Arduino 输出短触发脉冲(固件 PULSE_MS)并自动回 LOW。
+
+        pin=UNO_PIN(D8) -> 发 "NG"；pin=UNO_PIN2(D9) -> 发 "NG2"。
+        默认 UNO_PIN, 老调用方(tools/uno_manual_console.py)行为完全不变。
+        传入其它引脚值一律拒绝(fail-safe)：绝不把判定悄悄吹到错的那一路。
+        """
+        if int(pin) == UNO_PIN:
+            cmd, pin_used = "NG", UNO_PIN
+        elif int(pin) == UNO_PIN2:
+            cmd, pin_used = "NG2", UNO_PIN2
+        else:
+            print(f"[UNO][ERROR] 未知引脚 {pin}: 只有 D{UNO_PIN} / D{UNO_PIN2} 两路输出，拒绝发送")
+            return False
+        print(f"[UNO] {cmd} -> D{pin_used} 触发脉冲(脉宽由固件 PULSE_MS 控制)")
+        return self.send(cmd)
 
     def off(self) -> bool:
-        """用 OK 命令确保 D8 回到 LOW。"""
+        """用 OK 命令确保 D8/D9 两路都回到 LOW。"""
         return self.send("OK")
 
     def status(self) -> bool:
@@ -202,16 +222,49 @@ class UnoRelayController:
             self.ser = None
 
 
+class _DryRelay(UnoRelayController):
+    """不开串口的替身: 只把 send 换成打印, 其余走真实现。
+
+    用途: 无硬件时验证「引脚 -> 命令」的拼装是否正确(pulse(UNO_PIN) 必须发 "NG",
+    pulse(UNO_PIN2) 必须发 "NG2")。不碰串口, 产线机上也能安全跑。
+    """
+
+    @property
+    def connected(self) -> bool:
+        return True
+
+    def connect(self) -> bool:
+        return True
+
+    def send(self, command: str) -> bool:
+        print(f"[UNO][DRY-RUN] would send: {command}")
+        return True
+
+    def close(self) -> None:
+        print("[UNO][DRY-RUN] closed")
+
+
 def main() -> None:
-    """独立检查：STATUS -> NG -> STATUS。"""
-    controller = UnoRelayController()
-    if not controller.connect():
-        return
+    """独立检查(也是 L0' 两引脚验证)：STATUS -> NG(D8) -> STATUS -> NG2(D9) -> STATUS。
+
+    现场接 LED/万用表时，应看到 D8 先闪一下、再 D9 闪一下 —— 证明两路互不干扰。
+    加 --dry-run 则不碰串口，只打印将要发送的命令(无硬件时验证拼装)。
+    """
+    if "--dry-run" in sys.argv[1:]:
+        print("[UNO][DRY-RUN] 不实际开串口, 只打印将要发送的命令")
+        controller: UnoRelayController = _DryRelay()
+    else:
+        controller = UnoRelayController()
+        if not controller.connect():
+            return
     try:
         controller.status()
-        controller.pulse()
-        time.sleep(0.2)  # 等固件 50ms 脉冲结束(留足余量)后再查 STATUS，应见回到 LOW
-        controller.status()
+        for pin, label in ((UNO_PIN, "D8 第一站/正反面"), (UNO_PIN2, "D9 第二站/缺粒")):
+            print(f"[UNO] 测试 {label} ...")
+            controller.pulse(pin)
+            if not isinstance(controller, _DryRelay):
+                time.sleep(0.2)  # 等固件 50ms 脉冲结束(留足余量)后再查 STATUS, 应见回到 LOW
+                controller.status()
     finally:
         controller.close()
 
