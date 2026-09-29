@@ -9,13 +9,14 @@
     OK2\n     只把 D9 拉回 LOW；固件回 "OK2"
     STATUS\n  查询两路状态
 
-D8 = 第一站(正反面翻边止口)，D9 = 第二站(兜孔缺粒)。两路各自计时、互不阻塞、互不影响。
-电磁阀吹气的延迟/踢除时间由 PLC 自管，UNO 只负责给 PLC 一个干净的触发脉冲。
+D8 = 第一站(正反面翻边止口, 吹气把件从料道吹掉)，D9 = 第二站(兜孔缺粒, 开闸门放件掉进回收盒)。
+两路各自计时、互不阻塞、互不影响。执行器动作(吹气/开闸)的延迟与时长由 PLC 自管，UNO 只负责给
+PLC 一个干净的触发脉冲。
 固件对 NG/OK 立即 ACK，send() 收到即返回，不再空等 SERIAL_TIMEOUT。
 主程序只在最终判定 NG 时调用 pulse(pin)；OK 不发送指令。
 
 ⚠ 一条串口只能有一个主人：两个检测进程不能各自开同一个串口。产线上由主程序
-(main_pipeline.py) 独占本模块并代为吹气，检测进程只上报判定(见 station_link.py)。
+(main_pipeline.py) 独占本模块并代为触发执行器，检测进程只上报判定(见 station_link.py)。
 """
 from __future__ import annotations
 
@@ -173,7 +174,7 @@ class UnoRelayController:
         try:
             # 关键路径不等 ACK：脉冲在 write()+flush() 即发出，固件收到 NG 会立刻拉高 D8。
             # 读回执只是确认日志，且旧代码无论收没收到都 return True——空等最多 SERIAL_TIMEOUT
-            # (0.20s) 却不改任何行为，反而把吹气堵在单消费者主线程上，连累下一帧排队超时假 NG。
+            # (0.20s) 却不改任何行为，反而把执行触发堵在单消费者主线程上，连累下一帧排队超时假 NG。
             # 故此处不再自旋等回执；上一条命令的 ACK 字节由下次调用开头的 reset_input_buffer() 清掉。
             # 真正的串口故障(端口断/写不进)仍由 write()/flush() 抛异常被下面 except 捕获 -> return False。
             self.ser.reset_input_buffer()
@@ -189,7 +190,7 @@ class UnoRelayController:
 
         pin=UNO_PIN(D8) -> 发 "NG"；pin=UNO_PIN2(D9) -> 发 "NG2"。
         默认 UNO_PIN, 老调用方(tools/uno_manual_console.py)行为完全不变。
-        传入其它引脚值一律拒绝(fail-safe)：绝不把判定悄悄吹到错的那一路。
+        传入其它引脚值一律拒绝(fail-safe)：绝不把判定悄悄触发到错的那一路。
         """
         if int(pin) == UNO_PIN:
             cmd, pin_used = "NG", UNO_PIN
