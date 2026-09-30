@@ -82,6 +82,15 @@ CHILD_TERM_GRACE_S = 5.0  # 停机时先 terminate，这么久还没退再 kill
 UNO_DRAIN_S = 0.3  # 停机时等最后一个脉冲走完(固件 PULSE_MS=50ms)再 close 串口
 STATUS_INTERVAL_S = 60.0  # 定期打印监督摘要(0=关)
 
+# 常驻语义: 相机没上电**不是故障**。  子进程在这么长的启动建链窗口内一直重试连接而不退出,
+# 所以"先开的那台相机那一路先工作", 后开的那路等相机上电自然接上, 主程序绝不会因"连不上相机"
+# 反复重启子进程(churn)/误报连续失败。用有限大值(≈10 年)即可: 单调钟永远到不了这个 deadline,
+# 语义比 float('inf') 清晰。仅在 _run_child 里覆盖 inspector_pure 的模块级窗口, 基线一行不改。
+CAM_RESIDENT_WAIT_S = 10 * 365 * 24 * 3600  # ≈10 年(s): 子进程等相机上电的窗口
+# 向 UNO 双色 LED 刷健康态的周期(s)。**必须 < 固件 LED_WATCHDOG_MS(3s)**, 否则看门狗会把
+# "主程序没按时喂指令"误判成失联, 自动把绿灯打成红闪。1s 每次都发, 兼作"主程序还活着"的心跳。
+LED_REFRESH_S = 1.0
+
 SUP_LOG_DIR = os.path.join(PROJECT_ROOT, "data", "supervisor")
 SUP_LOG_BASENAME = "supervisor.log"
 SUP_LOG_RETAIN_DAYS = 14
@@ -156,6 +165,9 @@ class Supervisor:
         self._server = None  # station_link.VerdictServer
         self._drainers: List[threading.Thread] = []
         self._fatal_reason = ""
+        # 健康态 LED 的上一次状态与发送时刻(供 _drive_led 做"跳变即发 / 否则定期刷")
+        self._last_led: Optional[bool] = None
+        self._last_led_t = 0.0
 
     # ---------- 启动 ----------
     def start(self) -> int:
@@ -268,6 +280,39 @@ class Supervisor:
             st.link_up = False
         self.log.warning("[PIPE] 站 %s 上报链路断开(该站将自行停线, 等待重启)", station_id)
 
+    # ---------- 健康态 LED(绿=全部正常 / 红=有问题) ----------
+    def _compute_healthy(self) -> bool:
+        """绿灯的充要条件: UNO 在线, 且**每个站**都(进程活着 + IPC 建链 + 相机已就绪在判定)。
+
+        任一条不满足即红灯 —— 相机没上电、子进程挂了、IPC 断了都算"有问题"。刻意用
+        is_inspecting(该站发过 UP)而非仅 is_connected: 常驻等相机上电期间 IPC 早握好了, 但相机
+        还没通, 这时必须红灯。绿灯只能在"两台相机 + UNO 全部正常、正在判定"时亮 —— 绿灯不说谎。
+        """
+        if self._uno is None or not self._uno.connected or self._server is None:
+            return False
+        for st in self.stations:
+            alive = st.proc is not None and st.proc.poll() is None
+            if not (alive and self._server.is_connected(st.id)
+                    and self._server.is_inspecting(st.id)):
+                return False
+        return True
+
+    def _drive_led(self, now: float) -> None:
+        """把健康态刷给 UNO 双色 LED：状态跳变立即发, 否则每 LED_REFRESH_S 发一次
+        (既反映状态, 又持续喂固件看门狗证明主程序活着)。
+
+        最佳努力：发失败只是 LED 不准, 真正的执行安全由 pulse() 那条路把关, 且固件看门狗会在
+        失联 3s 后自动转红。不连真串口(--dry-uno)时经 _DryRelay.send 打印, 不影响判定/对账。
+        """
+        if self._uno is None:
+            return
+        healthy = self._compute_healthy()
+        if healthy == self._last_led and (now - self._last_led_t) < LED_REFRESH_S:
+            return
+        self._uno.set_led(healthy)
+        self._last_led = healthy
+        self._last_led_t = now
+
     # ---------- 巡检/重启 ----------
     def monitor_loop(self) -> None:
         """存活巡检 + 重启 + 定期摘要。"""
@@ -282,6 +327,7 @@ class Supervisor:
                 if rc is None:
                     continue
                 self._on_child_exit(st, rc)
+            self._drive_led(now)  # 每巡检周期刷一次健康态 LED(顺带喂固件看门狗)
             if next_status and now >= next_status:
                 next_status = now + self.status_interval
                 self.log_status()
@@ -353,6 +399,8 @@ class Supervisor:
         for st in self.stations:
             self._terminate(st)
         if self._uno is not None:
+            if self._uno.connected:
+                self._uno.set_led(False)  # 停机=产线未运行: 立刻显式红灯(不等固件看门狗那 3s)
             time.sleep(UNO_DRAIN_S)  # 别把刚发出去的 50ms 脉冲掐断
             self._uno.close()
         if self._server is not None:
@@ -404,10 +452,32 @@ def _run_child(station_id: str, child_argv: List[str]) -> int:
     # 所以在这里改模块属性就能让它拿到 IpcRelay —— inspector_pure.py 一行不用改。
     uno_relay.UnoRelayController = station_link.IpcRelay  # type: ignore[misc]
 
+    # 常驻语义：相机没上电不是故障 —— 把 inspector_pure 的启动建链窗口撑到 ≈10 年, 子进程就会在
+    # 窗口内一直重试连接而不退出。于是"先开的那台相机那一路先工作", 后开的那路等相机上电自然接上,
+    # 主程序永不因"连不上相机"反复重启(churn)。中途掉线仍走有限次 CAM_RECONNECT_TRY 重连 -> 耗尽
+    # 抛 AcquisitionError(rc=3) -> 主程序重启该站(此时 IPC 断, LED 如实转红, 绝不绿灯说谎)。
+    # 只覆盖模块级常量, 基线一行不改；inspector_missing 复用同一个 Vn2000Source, 一并生效。
+    import inspector_pure as _ip
+    _ip.CAM_STARTUP_WAIT_S = CAM_RESIDENT_WAIT_S  # type: ignore[attr-defined]
+
     cfg = next((s for s in STATIONS if s["id"] == station_id), None)
     if cfg is None:
         print("[PIPE][FATAL] 未知站点 %r" % station_id, flush=True)
         return 2
+
+    # 目录归拢: 与 inspector_missing 的 data/missing/* 对称, 把正反面站(inspector_pure)的
+    # 日志/结果图也收进 data/pure/{logs,OK,NG,RAW}, 不再散在 data/ 根下。手法同 CAM 窗口:
+    # 只覆盖 inspector_pure 的模块级目录常量(它们都是运行时才被 setup_runtime_logging/存图读取),
+    # 基线一行不改。inspector_pure.main() 不会重设 RUNTIME_LOG_DIR, OK/NG/RAW 也只有传 --save-dir
+    # 时才改(生产 argv 不传), 故这里的覆盖如实生效。inspector_missing 自己在 main() 里设 data/missing/*,
+    # 故只对 inspector_pure 这一站做, 免得互相顶。
+    if cfg["script"] == "inspector_pure.py":
+        _pure_root = os.path.join(_ip.DEFAULT_DATA_DIR, "pure")
+        _ip.RUNTIME_LOG_DIR = os.path.join(_pure_root, "logs")  # type: ignore[attr-defined]
+        _ip.OK_SAVE_DIR = os.path.join(_pure_root, "OK")  # type: ignore[attr-defined]
+        _ip.NG_SAVE_DIR = os.path.join(_pure_root, "NG")  # type: ignore[attr-defined]
+        _ip.RAW_SAVE_DIR = os.path.join(_pure_root, "RAW")  # type: ignore[attr-defined]
+
     module = os.path.splitext(cfg["script"])[0]
     print("[PIPE] 本站=%s, 检测器=%s, 判定将经主程序触发执行器(引脚由主程序按站点决定)"
           % (station_id, module), flush=True)
