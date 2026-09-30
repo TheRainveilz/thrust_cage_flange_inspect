@@ -9,6 +9,7 @@
 
     子→主   HELLO <station>    建链握手；主程序据此把这条连接绑定到某一站/某个引脚
     子→主   NG                 这一件判 NG，请触发该站对应的引脚(吹气或开闸)
+    子→主   UP                 相机已连上、该站开始正常判定(用于点亮"全部正常"绿灯)
     子→主   PING               存活(每 PING_INTERVAL_S 一次)
     主→子   READY <station>    握手确认
     主→子   PONG               存活应答
@@ -148,6 +149,10 @@ class VerdictServer:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._stations: dict[str, _LineConn] = {}
+        # 已上报 UP(相机连上、开始判定)的站集合。与"连接是否存在"(_stations)是两回事：
+        # 常驻等待相机上电时，IPC 早已握手(在 _stations 里)但相机还没通(不在 _inspecting 里)——
+        # 主程序据此把"该相机此刻没通"如实反映到红灯。握手/断连时都要复位它。
+        self._inspecting: set[str] = set()
         self._conns: list[socket.socket] = []
 
     # ---------- 生命周期 ----------
@@ -222,6 +227,10 @@ class VerdictServer:
                     continue
                 if line == "NG":
                     self.on_ng(station)
+                elif line == "UP":
+                    with self._lock:
+                        self._inspecting.add(station)  # 相机已连上, 该站开始正常判定
+                    self.log.info("[IPC] 站 %s 相机已就绪, 开始判定", station)
                 elif line == "PING":
                     conn.send_line("PONG")
                 elif line == "BYE":
@@ -238,6 +247,7 @@ class VerdictServer:
             with self._lock:
                 if self._stations.get(station) is conn:
                     self._stations.pop(station, None)
+                self._inspecting.discard(station)  # 断连即"该站不再判定" -> 绿灯随之熄
             # 只有"非正常断开且不是我们自己停机"才算链路丢失(主程序据此判断要不要重启该站)
             if not graceful and not self._stop.is_set() and self.on_link_lost is not None:
                 self.on_link_lost(station)
@@ -255,6 +265,7 @@ class VerdictServer:
         with self._lock:
             old = self._stations.get(station)
             self._stations[station] = conn
+            self._inspecting.discard(station)  # 新建链: 相机尚未确认就绪, 等它发 UP 再点绿灯
         if old is not None:
             self.log.warning("[IPC] 站 %s 重复建链，旧连接作废", station)
             old.close()
@@ -270,6 +281,14 @@ class VerdictServer:
         """该站当前是否有活连接(主程序用来判断"绝不能起一个触发不了执行器的检测器")。"""
         with self._lock:
             return station in self._stations
+
+    def is_inspecting(self, station: str) -> bool:
+        """该站相机是否已连上、已在正常判定(收到过 UP 且连接仍在)。
+
+        主程序用它来点"全部正常"绿灯：常驻等相机上电期间, 连接在但相机没通 -> 返回 False -> 亮红。
+        """
+        with self._lock:
+            return station in self._inspecting and station in self._stations
 
 
 class IpcRelay:
@@ -317,8 +336,16 @@ class IpcRelay:
         return self._conn is not None
 
     def connect(self) -> bool:
-        """连主程序并完成 HELLO/READY 握手；起保活线程。失败返回 False(调用方必须当致命处理)。"""
+        """连主程序并完成 HELLO/READY 握手；起保活线程。失败返回 False(调用方必须当致命处理)。
+
+        **第二次调用(已连接)= 相机已就绪的信号**：_run_child 在跑检测器之前先 connect() 一次
+        建好 IPC；随后 inspector_pure/inspector_missing 的 main() 在 build_source() 成功(相机连上)
+        之后又会 `UnoRelayController()`(=本单例) 并 connect() 一次。两个检测器都遵守"先建图源、
+        再 connect UNO"的顺序(inspector_missing 已据此调整)，所以这第二次 connect 恰好落在"相机通了"
+        的时刻 —— 借它给主程序发一条 UP，用于点亮"全部正常"绿灯，且完全不改 inspector_pure。
+        """
         if self.connected:
+            self._notify_up()  # 第二次(已连接)调用 = 相机已就绪, 通知主程序点绿灯
             return True
         if not self.station:
             self.log.error("[IPC] 未设置环境变量 %s，无法确定本站身份", STATION_ENV)
@@ -371,6 +398,16 @@ class IpcRelay:
     def off(self) -> bool:
         """无引脚可复位(主程序侧自管脉冲)，恒 True。"""
         return True
+
+    def _notify_up(self) -> None:
+        """告诉主程序"本站相机已就绪、开始判定"(最佳努力，失败不致命——保活线程会另行发现断链)。"""
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            conn.send_line("UP")
+        except OSError:
+            pass  # 真断了由 _ping_loop 的 PONG 超时接管停线, 这里不重复处理
 
     def status(self) -> bool:
         """无状态可查，恒 True。"""
