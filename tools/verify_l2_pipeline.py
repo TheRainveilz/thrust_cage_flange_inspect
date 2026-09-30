@@ -39,6 +39,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from verify_common import (DEFAULT_FRONT_DIR, DEFAULT_MISSING_DIR, FRONT_LOG_ROOT,  # noqa: E402
+                           FRONT_PIPELINE_LOG_ROOT,
                            GOLDEN_FRONT, MISSING_LOG_ROOT, PROJECT_ROOT, Report, count_escapes,
                            count_in, find_python, parse_frames, parse_summary, pure_is_clean,
                            read_new_lines, run, snapshot_sizes)
@@ -53,8 +54,15 @@ GOLDEN_MISSING = {"processed": 40, "n_ok": 3, "n_ng": 37}
 
 
 def log_root_for(station: str) -> str:
-    """该站的运行日志根目录（两站各写各的，绝不互踩）。"""
+    """该站**独立跑**的运行日志根目录（两站各写各的，绝不互踩）。"""
     return FRONT_LOG_ROOT if station == "front" else MISSING_LOG_ROOT
+
+
+def pipeline_log_root_for(station: str) -> str:
+    """该站**经主程序跑**的日志根。missing 不论怎么跑都写 data/missing/logs；
+    front 经主程序时被 main_pipeline 收拢到 data/pure/logs（独立跑仍是 data/logs）——
+    等价性比对因此各读各的根，比的是判定内容而非落盘位置。"""
+    return FRONT_PIPELINE_LOG_ROOT if station == "front" else MISSING_LOG_ROOT
 
 
 # ============================  两种跑法  ============================
@@ -75,7 +83,7 @@ def detector_run(py: str, script: str, sample_dir: str, station: str,
 def pipeline_run(py: str, stations: List[str], sample_dir: str,
                  dry_uno: bool = True) -> Tuple[int, List[str], Dict[str, Tuple]]:
     """B) 经**主程序**跑（可多站同跑）。返回 (rc, 主程序输出行, {站: (逐帧, [SUMMARY], 日志行)})。"""
-    before = {s: snapshot_sizes(log_root_for(s)) for s in stations}
+    before = {s: snapshot_sizes(pipeline_log_root_for(s)) for s in stations}
     argv = [py, MAIN, "--exit-when-done", "--status-interval", "0"]
     if dry_uno:
         argv.append("--dry-uno")
@@ -86,7 +94,7 @@ def pipeline_run(py: str, stations: List[str], sample_dir: str,
     lines = text.splitlines()
     out: Dict[str, Tuple] = {}
     for s in stations:
-        root = log_root_for(s)
+        root = pipeline_log_root_for(s)
         new = read_new_lines(before[s], root)
         out[s] = (parse_frames(new), parse_summary(new), new)
     return rc, lines, out
