@@ -1,9 +1,14 @@
 # WTX-3000-360C 成像条件记录
 
-> 本文件与 `thrust_cage_flange_inspect.py` 的头部常量**成对生效**。相机参数一改，
+> 本文件与 `../src/flange_inspect/inspector_pure.py` 的头部常量 **成对生效**。相机参数一改，
 > 部分阈值就失效（见第 4 节）。改动前先在第 6 节登记，改完后按第 5 节清单复检。
+>
+> **本文件只记第一站相机（`169.254.44.201`，正反面翻边止口 → D8 吹气）。** 第二站
+> （`169.254.44.202`，兜孔缺粒 → D9 开闸落料）走**同一套 10001 私有协议、同一个 `Vn2000Source`
+> 取图类**，取图/残帧标记/与传感器张数一一对齐的逻辑两站完全一致，差别只有 IP、成像参数与判据阈值。
+> 第二站的成像参数要**另标一套**、照本文件格式**另起一份记录**，别混写进来——两站标定值互相污染就都不可信了。
 
-- 对应算法版本：`thrust_cage_flange_inspect.py` @ commit `______`
+- 对应算法版本：`../src/flange_inspect/inspector_pure.py` @ commit `______`
 - 料号 / 工件名：金属推力保持架垫片（整圈 18 个兜孔）
 - 本文件最后更新：`2026-09-05`（IO 硬触发现场复验通过，见 1.5 / 3.1 / 第 5 节 0b 步） / 填写人 `______`
 
@@ -245,7 +250,7 @@ PC→CAM 的配置帧里直接带着这一整组，说明曝光/增益/Gamma/焦
    不落盘、不过 JPEG。上线用 **IO 外部硬触发**（`CAM_TRIGGER_ORDER = "external"`）：算法只保活、
    被动等帧，一个触发沿 = 一件 = 一帧，曝光时刻由工装决定；台上调试可切 `--trigger MainRunOnce`
    走软触发。实测 0.3 ~ 0.65 s/帧（帧到手→判完）。实现见
-   `thrust_cage_flange_inspect.py` 的 `Wtx10001Source`
+   `../src/flange_inspect/inspector_pure.py` 的 `Wtx10001Source`
 2. **`watch` 存图模式（备用）** —— MJ_Aisensor 照常存图，算法监视存图目录。
    好处是压缩质量与标阈值用的样本完全一致；代价是多一次落盘，且
    ⚠ **依赖 MJ 真的在存图**：2026-09-05 实测点 3 次「执行」，存图目录里一张新图都没多，
@@ -365,7 +370,7 @@ PC→CAM 的配置帧里直接带着这一整组，说明曝光/增益/Gamma/焦
 按顺序做，每步不过就别往下走：
 
 0. **（换到 `camera` 直连时先做这步）** 确认取图链路本身通：
-   `python thrust_cage_flange_inspect.py --mode camera --limit 3 --debug`
+   `python src/flange_inspect/inspector_pure.py --mode camera --limit 3 --debug`
    看是否每帧都打印出定位信息（打印得出来就说明 1280×800 帧完整解开了）。⚠ 这一步只验证取图，
    **不看 OK/NG**：直连取景还没标定，工件没摆正时判 NG 是正常的
 0b. **确认触发是 IO 硬触发，不是自由连跑**（✅ 2026-09-05 已通过一次；每次在 MJ 里动过触发设置、
@@ -375,10 +380,10 @@ PC→CAM 的配置帧里直接带着这一整组，说明曝光/增益/Gamma/焦
    再给 N 次工装到位信号，应当**恰好多出 N 帧**。2026-09-05 实测：空等 92 s 零帧，给 3 次得 3 帧。
    若不给信号也在刷帧，说明触发源又变回软触发/自由运行，回 MJ 再改（算法侧改不了，见 1.8.2）；
    若给了信号也不出帧，先看方案是不是被上一轮软触发的 `StopRun` 停住了
-1. `python thrust_cage_flange_inspect.py --dir docs/ref --holes 0 --debug`
+1. `python src/flange_inspect/inspector_pure.py --dir docs/ref --holes 0 --debug`
    跑基准图，对照第 3 节数字（孔半径、节圆残差、孔壁对比度、压痕圆度），注意用同一取景那一组
 2. 看叠加图：蓝圈节圆是否套住所有孔心 → 青圈孔 ROI 是否套住翻边 → 绿框拐角是否压在压痕上
-3. `python thrust_cage_flange_inspect.py --calib --dir docs/ref`
+3. `python src/flange_inspect/inspector_pure.py --calib --dir docs/ref`
    核对 `CORNER_SPEC` 与 `MARK_R_RATIO_RANGE`，偏差超 5° / 0.1 就抄新值进头部
 4. 正面样本至少 20 张，要求**全部判 OK**，且每张有 ≥2 个孔双特征全过（留余量）
 5. 反面样本至少 20 张，要求**全部判 NG**，且 NG 代码是 `NG_NO_FEATURE`
@@ -386,14 +391,14 @@ PC→CAM 的配置帧里直接带着这一整组，说明曝光/增益/Gamma/焦
 6. 边界样本（漏冲、油污、毛刺）逐张看叠加图，确认判定原因和肉眼一致
 7. 全部通过后，更新本文件第 1、3 节数值和第 6 节变更记录，连同头部常量一起提交
 
-> 第 4、5 步的样本文件名要带 `正`/`反`（或 `front`/`back`）：`dbg_report.py` 的 `guess_label()`
+> 第 4、5 步的样本文件名要带 `正`/`反`（或 `front`/`back`）：`../tools/dbg_report.py` 的 `guess_label()`
 > 靠文件名推真值，推不出来 `--sweep` 的阈值网格只会显示 `0/0`，读不出推荐阈值。
 > 2026-09-04 的两张样本（`1_4256379.jpg` / `8_4222844.jpg`）就是这种情况。
-> 走 `camera` 直连时帧名是 `CAM#序号` / `CAM_<相机时间戳>`，同样推不出真值——**不用重命名**，
+> 走 `camera` 直连时帧名是 `CAM#序号` / `CAM_<相机时间戳>`，同样推不出真值—— **不用重命名**，
 > 按轮次分目录采、分析时强制真值即可：
 >
 > ```bash
-> python thrust_cage_flange_inspect.py --mode camera --collect "D:\zq\samples\直连_正"
+> python inspector_pure.py --mode camera --collect "D:\zq\samples\直连_正"
 > python dbg_report.py --dir "D:\zq\samples\直连_正" --holes 0 --sweep --truth front
 > ```
 >
