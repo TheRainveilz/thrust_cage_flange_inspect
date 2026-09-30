@@ -60,14 +60,16 @@ STATIONS: List[Dict] = [
         # --holes 0 = 判全部孔。这是黄金基线(318/352 & 反面 623/623 零逃逸)验证时的配置，
         # 值上等于 inspector_pure 的模块默认，但**写出来**才是对生产配置的忠实镜像：
         # 哪天默认值被改动，这里仍能保证跑的是已验证配置。
-        "argv": ["--mode", "camera", "--holes", "0", "--quiet", "--timing"],
+        # "argv": ["--mode", "camera", "--holes", "0", "--quiet", "--timing"], # 测试环境带--timing用于查看判定耗时
+        "argv": ["--mode", "camera", "--holes", "0", "--quiet"], # 生产环境不带--timing
     },
     {
         "id": "missing",
         "script": "inspector_missing.py",
         "ip": "169.254.44.202",
         "pin": uno_relay.UNO_PIN2,  # D9
-        "argv": ["--mode", "camera", "--quiet", "--timing"],
+        # "argv": ["--mode", "camera", "--quiet", "--timing"],# 测试环境带--timing用于查看判定耗时
+        "argv": ["--mode", "camera", "--quiet"], # 生产环境不带--timing
     },
 ]
 
