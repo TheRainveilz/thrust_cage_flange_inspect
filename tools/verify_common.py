@@ -36,6 +36,9 @@ for _stream in (sys.stdout, sys.stderr):
 # 两站的运行日志根目录(与 inspector_pure / inspector_missing 的常量保持一致)
 FRONT_LOG_ROOT = os.path.join(PROJECT_ROOT, "data", "logs")
 MISSING_LOG_ROOT = os.path.join(PROJECT_ROOT, "data", "missing", "logs")
+# front 经主程序跑时, main_pipeline 把它的日志收拢到 data/pure/logs(与 data/missing/* 对称);
+# 独立跑 inspector_pure 仍写 data/logs(基线一行不改, 无处覆盖模块级常量)。两条链因此各读各的根。
+FRONT_PIPELINE_LOG_ROOT = os.path.join(PROJECT_ROOT, "data", "pure", "logs")
 
 # 默认样本目录
 DEFAULT_FRONT_DIR = os.path.join(PROJECT_ROOT, "datasets", "flange")
