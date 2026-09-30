@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""UNO 手动控制台(调试用): 手动发 OK/NG/STATUS 给 Arduino UNO。
+"""UNO 手动控制台(调试用): 手动发 OK/NG/NG2/STATUS 给 Arduino UNO。
+
+NG -> D8(第一站 吹气)、NG2 -> D9(第二站 开闸落料)，两路各自独立触发，用来现场逐路核对
+光耦/PLC 接线是否对号入座(发 NG 只该第一站动、发 NG2 只该第二站动)。
 
 动作全部委托给 uno_relay.UnoRelayController, 因此自动继承它的自愈能力:
 CH340 自动探测、显式端口连不上时回退到探测口、send 时断线自动重连、中文错误诊断,
@@ -12,7 +15,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src", "flange_inspect"))
-from uno_relay import UnoRelayController
+from uno_relay import UNO_PIN, UNO_PIN2, UnoRelayController
 
 ctrl = UnoRelayController()
 if not ctrl.connect():
@@ -30,10 +33,11 @@ try:
     while True:
         print()
         print("请选择测试功能：")
-        print("1. OK     (D8 保持 LOW, 不触发 PLC)")
-        print("2. NG     (D8 输出触发脉冲, 脉宽由固件 PULSE_MS 决定)")
-        print("3. STATUS (查询 D8 状态)")
-        print("4. 退出")
+        print("1. OK      (D8/D9 都保持 LOW, 不触发 PLC)")
+        print("2. NG      (D8 输出触发脉冲 -> 第一站 吹气；脉宽由固件 PULSE_MS 决定)")
+        print("3. NG2     (D9 输出触发脉冲 -> 第二站 开闸落料；脉宽由固件 PULSE_MS 决定)")
+        print("4. STATUS  (查询 D8/D9 状态)")
+        print("5. 退出")
 
         choice = input("请输入：").strip()
 
@@ -41,10 +45,16 @@ try:
             print("已发送：OK" if ctrl.off() else "发送失败：OK(串口异常, 见上方日志)")
 
         elif choice == "2":
-            print("已发送：NG" if ctrl.pulse() else "发送失败：NG(串口异常, 见上方日志)")
+            ok = ctrl.pulse(UNO_PIN)   # -> NG，D8 一个短脉冲
+            print("已发送：NG (D8)" if ok else "发送失败：NG(串口异常, 见上方日志)")
             time.sleep(0.2)  # 等固件脉冲(PULSE_MS)结束再回菜单
 
         elif choice == "3":
+            ok = ctrl.pulse(UNO_PIN2)  # -> NG2，D9 一个短脉冲
+            print("已发送：NG2 (D9)" if ok else "发送失败：NG2(串口异常, 见上方日志)")
+            time.sleep(0.2)
+
+        elif choice == "4":
             if ctrl.status():
                 time.sleep(0.15)  # 给固件回执到达的时间
                 resp = (ctrl.ser.readline().decode("utf-8", errors="ignore").strip()
@@ -53,12 +63,12 @@ try:
             else:
                 print("发送失败：STATUS(串口异常, 见上方日志)")
 
-        elif choice == "4":
+        elif choice == "5":
             print("退出测试程序")
             break
 
         else:
-            print("输入错误，请输入 1、2、3 或 4")
+            print("输入错误，请输入 1、2、3、4 或 5")
 finally:
-    ctrl.close()  # 内部会先发 OK 确保 D8 回 LOW 再关串口
+    ctrl.close()  # 内部会先发 OK 确保 D8/D9 回 LOW 再关串口
     print("串口已关闭")
