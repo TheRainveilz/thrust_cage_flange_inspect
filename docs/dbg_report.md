@@ -1,9 +1,14 @@
 # dbg_report —— 外挂调试报告工具
 
-`thrust_cage_flange_inspect.py` 的调试外挂：**不修改主算法文件**，通过 import 复用它的函数与
+`../src/flange_inspect/inspector_pure.py` 的调试外挂：**不修改主算法文件**，通过 import 复用它的函数与
 阈值，产出定阈值用的 CSV 与排查用的固定版式拼图。
 
 主算法是交付件，不往里塞调试代码；工具本身可以随意改、随意扔，不牵连算法的回归。
+
+> **只服务第一站（`inspector_pure.py`，正反面翻边止口）。** 第二站缺粒判据
+> （`inspector_missing.py`，半径比 0.144 主 + 球面高光 120 辅，二期标定的另一套阈值）**不在本工具覆盖范围内**
+> ——它的标定证据是在 `datasets/缺粒样本` 上跑 `tools/verify_l1_missing.py` 得到的（40 张 100% / 0 逃逸），
+> 不经 dbg_report 的圆度/半径网格。缺粒站要做类似的离线阈值扫描，得另写一份对应的外挂。
 
 ## 设计取舍
 
@@ -55,7 +60,7 @@ python dbg_report.py --dir "D:\反面样本" --limit 20
 
 ### 改样本目录 / 输出目录
 
-不想每次敲 `--dir`，改 `dbg_report.py` 顶部「路径」一节的两行（留空 = 用主模块的值）：
+不想每次敲 `--dir`，改 `../tools/dbg_report.py` 顶部「路径」一节的两行（留空 = 用主模块的值）：
 
 ```python
 IMAGE_DIR = r"D:\新建文件夹\WTX3000-360C (DA7486717)"
