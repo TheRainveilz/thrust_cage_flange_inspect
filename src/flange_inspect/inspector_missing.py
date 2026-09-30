@@ -481,7 +481,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "样本量小，上线前须再复跑零逃逸自检。",
              BALL_R_RATIO_MIN, BALL_HIGHLIGHT_MIN, N_POCKETS)
 
-    # 离线跑样本时执行器没有意义；产线上永远走主程序(那时这里是 IpcRelay)。
+    try:
+        source = build_source(args)
+    except Exception as exc:  # noqa: BLE001
+        log.critical("[FATAL] 取图源建立失败: %s", exc)
+        return 2
+
+    # 执行器在"图源(相机)已就绪"之后再连 —— 与 inspector_pure 的 main() 同序(先 build_source
+    # 再 connect UNO)。这一顺序对 IpcRelay 很关键：_run_child 已先 connect() 建好 IPC，这里的
+    # 第二次 connect() 恰好落在"相机通了"的时刻，IpcRelay 会借它给主程序发 UP 点亮"全部正常"绿灯。
+    # 离线跑样本(--no-uno)时执行器没有意义；产线上永远走主程序(那时这里是 IpcRelay)。
     uno = None
     if not args.no_uno:
         try:
@@ -493,14 +502,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as exc:  # noqa: BLE001
             log.warning("[WARN] 执行器初始化失败: %s", exc)
             uno = None
-
-    try:
-        source = build_source(args)
-    except Exception as exc:  # noqa: BLE001
-        log.critical("[FATAL] 取图源建立失败: %s", exc)
-        if uno is not None:
-            uno.close()
-        return 2
 
     deadline_active = args.mode != "local"  # 本地样本没有触发节拍，不算时限
     counts = {"ok": 0, "ng": 0, "bad": 0, "timeout": 0, "uno_fail": 0, "no_actuator": 0,
