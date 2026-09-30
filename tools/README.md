@@ -53,6 +53,14 @@
 
 ---
 
+## ④ 文档渲染（把仓库 Markdown 转成离线可看的 HTML）
+
+| 脚本 | 干嘛 | 怎么跑 |
+|---|---|---|
+| `render_docs_html.py` | 把 `README.md` / `docs/*.md` / `tools/README.md` 转成 `docs_html/` 下同构的 `.html`（文档间 `.md` 链接自动改写成 `.html`，带表格/代码/引用样式，双击即看）。**零依赖**、只用标准库，没网/没 pip 的产线机也能跑；用了新语法就补它、别引依赖 | `python tools/render_docs_html.py [--open]`（任何仓库 Python 3.8+，**不需要 cv2**） |
+
+> 产物 `docs_html/` 默认在 `.gitignore` 里（按需重跑即可）；想把 HTML 一起交给没装 Python 的人直接看，就把 `.gitignore` 里那行删掉再提交。
+
 ## 要不要给每个脚本单独写文档？——不用
 
 问过一轮：这 12 个脚本**都已经带了实打实的头部 docstring**（怎么跑、为什么这么写、跟谁耦合都在里面），
