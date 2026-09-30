@@ -5,3 +5,6 @@ __pycache__/
 # 文档渲染产物（tools/render_docs_html.py 生成，按需重跑即可；
 # 若想把 HTML 一起提交给没装 Python 的人直接看，删掉下面这行）
 docs_html/
+
+# 这份东西绝不能进版本库 —— 别删这行）
+settlement_onepager.html
