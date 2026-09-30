@@ -1,387 +1,199 @@
 # thrust_cage_flange_inspect
 
-金属推力保持架垫片 —— 冲压翻边**正/反面**自动判别（OpenCV-Python 后台算法，无 GUI）。
+金属推力保持架垫片 —— **双站视觉检测线**。一台 i3-4130T、一块 Arduino UNO，两台传感相机各守一个工位，
+各拍各的件、互不配对、互不干扰；一站挂了另一站照跑。
 
-针对 WTX-3000-360C 智能相机采集的图像，判断工件当前朝向：兜孔外侧带冲压翻边、四个拐角有小圆压痕
-的为**正面 OK**；只有单圈冲裁轮廓、拐角无压痕的为**反面 NG**。工件可任意旋转、偏移，无需固定 ROI。
+| 站 | 相机 | 判什么 | NG 动作 | 算法 |
+|---|---|---|---|---|
+| **第一站 · 正反面翻边止口** | `169.254.44.201` | 正/反面朝向 | **D8 吹气**剔除 | `inspector_pure.py`（黄金基线，正 318/352、反 623/623，零逃逸） |
+| **第二站 · 兜孔缺粒** | `169.254.44.202` | 18 个兜孔是否都压到位有球 | **D9 开闸**放件落回收盒 | `inspector_missing.py`（二期判据，40 张标定 100% / 0 逃逸 / 0 过杀） |
+
+两站共用同一套 10001 私有协议取图（`inspector_pure.Vn2000Source`），因此残帧标记、与传感器张数
+一一对齐等取图逻辑两站完全一致，差别只有 IP 与落盘目录。
 
 ---
 
-## 特性
+## 架构
 
-- **无固定 ROI**：用兜孔孔心做最小二乘圆拟合（迭代剔野点）得到节圆 → 工件中心 + 节圆半径，
-  任意旋转/偏移自适应；**即使垫片外圆被视场切掉也能定位**
-- **双特征联合判定**
-  - 特征A：孔 ROI 内多阈值二值化 → 同心轮廓计数，判断是否存在翻边外圈
-  - 特征B：4 个拐角微小 ROI 内 `circularity = 4πA/P² > 0.75` 判定有效冲压压痕
-- **抗干扰**：中值滤波压铁屑/椒盐噪点、CLAHE 抗油污与光照不均、同心性+角度覆盖率过滤毛刺碎轮廓、
-  Hough 形状级预筛剔除非圆干扰、多阈值扫描解决压痕与翻边粘连
-- **取图四态一键切换**：本地文件夹遍历调试 ↔ **10001 私有协议真直连相机（产线，IO 外部硬触发，
-  已跑通）** ↔ 监视存图目录（备用）↔ 相机 HTTP 接口（本机型无此服务）
-- **全部阈值集中在文件头部** 10 个分节，现场改参数不动业务逻辑
-- 换型标定工具（`--calib`）、NG 图自动落盘、叠加调试图、Modbus-TCP 对接 PLC 占位
+```
+main_pipeline.py  ← systemd 只跑这一个（主程序 / 监督者）
+   │  · 独占 UNO 串口（唯一主人）
+   │  · VerdictServer 监听 127.0.0.1:47653，收两站上报的 NG
+   │  · front 的 NG → pulse(D8=吹气)；missing 的 NG → pulse(D9=开闸)
+   │  · 监控两子进程：一条挂了 → 告警 + 短退避重启它，不动另一条
+   │  · 驱动 UNO 双色 LED 健康态（D10 绿 / D11 红）
+   │
+   ├─ 子进程 A: main_pipeline.py --child front
+   │      uno_relay.UnoRelayController = station_link.IpcRelay  （唯一执行点被透明转发）
+   │      → inspector_pure.main([--mode camera --ip .201 --holes 0 --quiet --timing])
+   │
+   └─ 子进程 B: inspector_missing.py --mode camera --ip .202 --quiet --timing
+          缺粒检测，NG 同样经 IpcRelay 上报主程序
+
+        两条 IPC 通道各自保活；任一侧发现链路死了 → 该站主动停线（fail-safe）
+```
+
+### 关键决策（为什么这么绕）
+
+- **一块 UNO 只有一条串口** → 串口收敛到唯一主人（主程序），两子进程只判定、NG 经 IPC 上报、主程序
+  代触发。回退选项：换两块 UNO（每站各一块独占自己串口）可把 `station_link.py` 与 `--child` 整层删掉，
+  执行路径回到与单站时代完全一致，代价是多一块板 + 一个 USB 口。
+- **`inspector_pure.py` 一行不改** → 子进程 A 在调 `ip.main()` 之前把 `uno_relay.UnoRelayController`
+  换成 `IpcRelay`，`main()` 里的局部 import 就拿到替身，唯一执行点 `emit_control`（`if not is_ok: uno.pulse()`）
+  被透明转发。扩展一律靠**从外部覆盖模块全局**（`_run_child` / `inspector_missing._apply_dirs`），
+  全局在调用时才读，启动前覆盖即生效。
+- **常驻**：相机没上电不是故障、不退出（≈10 年建链窗口覆盖 `CAM_STARTUP_WAIT_S`），哪路相机先通先
+  工作那路。中途掉线仍走有限 3 次重连 → 耗尽则退 → 主程序重启该站（让 IPC 断开、LED 如实转红，
+  绝不原地无限重连假装还活着）。
+- **双色 LED 健康态**：绿的充要 = UNO 连着 且**每个站**（进程活 + IPC 连上 + **正在判定** `is_inspecting`）。
+  用 `is_inspecting` 而非 `is_connected`——IPC 握手在相机通之前就成立，那时必须红。看门狗 3s，
+  `LED_REFRESH_S(1.0s) < 3s`，否则看门狗误判主程序失联把绿打成红。开机默认红（还没确认过健康）。
+
+## 跑起来
+
+产线（唯一入口，systemd 只跑这一个）：
+
+```bash
+./run_pipeline.sh                       # = python src/flange_inspect/main_pipeline.py
+```
+
+无 UNO 时主程序**拒绝启动任何检测站**（fail-safe，rc=2）——绝不跑一个触发不了执行器的检测器。
+
+单站离线调试（不接硬件、不碰串口）：
+
+```bash
+python src/flange_inspect/inspector_pure.py    --mode local --dir <正反面样本> --holes 0
+python src/flange_inspect/inspector_missing.py --mode local --dir <缺粒样本>
+python tools/uno_manual_console.py             # 手动逐路发 D8/D9，现场核对光耦→PLC 接线
+```
+
+## 安全铁律（不可协商）
+
+- **零逃逸**：真值 NG 判 OK 绝不可接受；过杀（OK 判 NG）可接受。任何「判定→执行」链路失效必须**停该站**，
+  而不是继续判却触发不了执行器（那样 NG 件直接流过去）。
+- **`inspector_pure.py` 一行不改**：黄金基线，改了它「判定一致」就不再是黄金基线的结论。
+- **`--no-uno` 绝不透传给产线子进程**：带它时 IPC 照样建链，但检测器此后永不调 `pulse()` → 主程序一条
+  NG 都收不到 → 判定照跑、执行器不动 = 逃逸。只在 `--mode local` 离线跑样本时用。
+- **日志字符串与 verify 同步**：`[PIPE] 站 <station> NG -> 触发 D<pin>` 被 `tools/verify_l2_pipeline.py`
+  的 `check_actuation` 逐字解析。改这行日志必须同步改 verify。
+- **引脚映射整词匹配**：D8 发 `NG`（第一站吹气）、D9 发 `NG2`（第二站开闸）。`NG` 是 `NG2` 的前缀，
+  数命令必须整词匹配，否则两站同跑时 D8/D9 会串成一堆。
+
+## 目录与日志
+
+| 用途 | 目录 |
+|---|---|
+| 第一站（经主程序） | `data/pure/{logs,OK,NG,RAW}` |
+| 第二站 | `data/missing/{logs,OK,NG,RAW}` |
+| 主程序 | `data/supervisor/logs` |
+
+两站日志系统**同源**（`inspector_missing` 复用 `inspector_pure.setup_runtime_logging`，只覆盖目录）：
+保留 **7 天**、单文件滚动 **20MB**、每 **6h** 巡清一次，按北京时间 `YYYY/MM/DD` 分天。各进程各自起清理
+线程守自己那棵目录树。产线只清 `data/pure/logs` 与 `data/missing/logs`；老的 `data/logs` 只有单独手跑
+`inspector_pure` 时才写，产线不碰、可不管。
+
+产线默认**不存 RAW**（图太多，只留 `.log`），仅 `--debug` 时存 RAW + 结果图。RAW 一旦开仍要求与传感器
+张数一一对齐、残帧标 `PARTIAL`。
+
+## 数据集（Git LFS，已定版不再新增）
+
+| 数据集 | 张数 | 布局 |
+|---|---|---|
+| `datasets/flange` | 975 jpg | `OK` / `NG` |
+| `datasets/缺粒样本` | 40 png | `正面/{OK,NG}`、`反面/{NG,正常手动反面样本}` |
+
+`.gitattributes` 里 `datasets/**/*.{jpg,jpeg,png}` 全走 LFS，新增图片自动纳管。
+
+## 验证
+
+| 层 | 内容 | 状态 |
+|---|---|---|
+| **L1** | 缺粒算法零逃逸（`tools/verify_l1_missing.py`） | ✅ 7/0（警告=过杀 2 帧，方向可接受） |
+| **L2** | 主程序代管串口 + IPC 转发的**等价性**（`tools/verify_l2_pipeline.py`）：同一样本目录，独立跑 vs 经主程序跑，逐帧判定必须逐条相同；每次 NG 恰好一次对应引脚脉冲、不串路 | ✅ 52/0（开发机插着 CH340 时段②SKIP，正常） |
+| **L3** | 双站联调：两台真相机 + 真 UNO，D8/D9 各走各路不串 | ⏳ 待现场 |
+| **L4** | 安全验证：①杀主程序 → 两子进程都停 ②杀一个子进程 → 另一个照跑且被重启 ③断 IPC → 该站停线而非空判 | ⏳ 待现场（③必须实测，不能只看代码） |
+
+逐帧判定只能从 `.log` 读（产线子进程带 `--quiet`，逐帧 `[INSPECT-DONE]` 只进文件不进控制台），
+所以两条链比对时都从 `.log` 取，同一把尺子。固件 `firmware/uno_plc_trigger/uno_plc_trigger.ino`
+**已重烧**（D8/D9 两路独立非阻塞脉冲 + `HEALTHY`/`FAULT` + 看门狗 3s，开机默认红闪）。
+
+## 还差什么
+
+**只差上生产机接两个传感器实测**：接好两台相机（`.201` / `.202`）+ UNO（D8/D9 各接执行器、
+D10/D11 接双色 LED）→ 跑 `./run_pipeline.sh` → 过 L3 / L4。软件层 L1 / L2 已全绿。
+
+## 硬件链
+
+```
+相机 .201 ─┐                                  ┌─ D8 ─→ 光耦 ─→ PLC ─→ 第一站吹气
+           ├→ i3-4130T (main_pipeline) → UNO ─┤─ D9 ─→ 光耦 ─→ PLC ─→ 第二站开闸落料
+相机 .202 ─┘                                  ├─ D10 ─→ 绿 LED（两相机+UNO 全在判定）
+                                              └─ D11 ─→ 红 LED（任一未就绪 / 失联，闪烁）
+```
+
+一块 UNO，固件把「一路脉冲」扩成 D8 / D9 两路独立计时（各自到时自动回 LOW，互不阻塞）。
+串口/波特率以 `uno_relay.py` 为唯一定义源；`pulse()` 无参默认仍是 D8（向后兼容）。
+
+## 文件地图
+
+| 文件 | 作用 |
+|---|---|
+| `src/flange_inspect/main_pipeline.py` | 主程序：独占 UNO、VerdictServer、拉起/监控两子进程、`--child front` 入口、LED 健康态、日志汇聚 |
+| `src/flange_inspect/station_link.py` | 判定上报通道：`IpcRelay`（子进程侧鸭子替身）+ `VerdictServer`（主程序侧），localhost TCP 行协议 |
+| `src/flange_inspect/inspector_pure.py` | 第一站算法（**黄金基线，勿改**），也是取图类 `Vn2000Source` / 日志系统的来源 |
+| `src/flange_inspect/inspector_missing.py` | 第二站算法（缺粒），复用 `inspector_pure` 的取图/日志/图像助手，自带 `main()` 与目录常量 |
+| `src/flange_inspect/uno_relay.py` | UNO 串口控制器：`UNO_PIN=8` / `UNO_PIN2=9`、`pulse()`、`set_led()`、自愈重连 |
+| `firmware/uno_plc_trigger/uno_plc_trigger.ino` | UNO 固件：D8/D9 双路脉冲 + 双色 LED + 看门狗 |
+| `tools/uno_manual_console.py` | 手动逐路发 D8/D9/STATUS，核对接线 |
+| `tools/verify_l1_missing.py` / `verify_l2_pipeline.py` | L1 / L2 验证闸 |
+| `tools/README.md` | **tools 目录索引**：验证闸 / 硬件调试 / 第一站调参诊断 三类，每个脚本一行（其余 `dbg_report.py`、`analyze_feature_ab.py`、`_diag_*` 都在里面） |
+| `docs/camera_config.md` / `docs/dbg_report.md` | 第一站相机成像标定记录（带变更账本）/ `dbg_report` 调试外挂说明 |
+| `docs/missing_camera_config.md` | 第二站（缺粒）相机成像标定记录：光极性/三半径收敛等成像前提 + `.202` 参数待现场标定清单（算法判据在 `inspector_missing.py`，不重复） |
+| `docs/tuning_notes.md` | 第一站算法调参史 / 证伪账：代码只存最终阈值，这本存「为什么这么选、试过哪些没走通」（特征A/B、反面定位P0、广度闸、成像天花板、为什么不用C++） |
+
+## 第一站成像与标定细节
+
+第一站的 10001 私有协议、几何标定值、触发源设置（**上线必须 IO 硬触发**）、以及「取图通了 ≠ 可以判定」
+的整套成像清单，都是 `inspector_pure` 时代验证下来、现在仍然有效的知识。完整内容见 **代码头部 10 个分节
+阈值常量** 与 [`docs/camera_config.md`](docs/camera_config.md)（相机参数是标定值的另一半 + 换相机后的
+复检清单）。几条必记的硬约束：
+
+- **分辨率绑死标定**：直连帧 1280×800 无压缩灰度，一帧恰好 1024000 字节。标定像素值（孔径 50.7px /
+  节圆 396.9px）绑在 1216×1024 存图取景上，直连取景要 `--calib` 重标（实测整体缩到 ~0.80 倍，
+  `HOLE_R_MIN_RATIO` 只剩 6% 余量）；按 `r` 比例写的常量仍成立。
+- **触发源必须 IO 硬触发**（一个触发沿 = 一件 = 一帧，结构上不可能判到上一件）。用过
+  `--trigger MainRunOnce` 后相机会被收尾的 `StopRun` 停住，要在 MJ 里重置运行态才再出图。
+- **正反鉴别力全在每孔压痕个数**（`MIN_VALID_MARKS=2`），不是圆度阈值——提 `MARK_CIRCULARITY_MIN`
+  会先杀正面、救不了反面（它只剔毛刺碎轮廓）。
+- 上线前仍要处理的成像问题：画面中央那条饱和亮带、确认并关掉 `ATMode:2` 自动曝光。
+
+PLC 对接走 UNO → 光耦这条硬件链（见上「硬件链」），不再用软件 Modbus。
+
+## 常见坑与现场排查
+
+上机时最容易卡住的几处，都是**踩过的**，按现象查：
+
+| 现象 | 根因 | 处理 |
+|---|---|---|
+| 主程序起不来，`rc=2`，日志「拒绝启动任何检测站」 | **没插 UNO**（或 CH340 没认出） | 这是 fail-safe 设计，不是 bug：绝不跑一个触发不了执行器的检测器。插好 UNO 再跑 |
+| 相机连不上 / 连错相机 | 同网段现在有**两台**相机，`discover_camera_ip()`（唯一应答者才算）**必然失效**回退到默认 IP | 两站都由 `main_pipeline.STATIONS` 里的 `ip` **显式指定**（已这样做）。单站 `run_inspector.sh` 不带 `--ip` 的自动探测在双相机现场**不再可靠**，调试也要显式给 IP |
+| 切回 IO 硬触发后相机 23 s 一帧不出 | 上一轮用过软触发（`--trigger MainRunOnce`），相机被收尾的 `StopRun` 停在非运行态 | 去 MJ 里把方案重新置为运行态（或再发一次软触发）。`external` 模式自己从不发 `StopRun`，上线运行不会造成这个状态 |
+| 跑完 NG 证据图不见了 / `data/.../RAW` 空 | 有清理软件在删目录（现场出现过 `result` 目录自行消失，算法只创建从不删除）；且产线**默认不存 RAW**，仅 `--debug` 存 | 先确认是不是没开 `--debug`；要留证据先查清哪个清理软件在删那棵目录树 |
+| 第二站整批判反（该 OK 的判 NG 或反之） | **光极性搞反**——判据认定「有球 = 兜孔中心比台面**暗** + 一个球面高光点」，光路一改极性就全错（这个坑踩过一次） | 现场按 `docs/missing_camera_config.md` 复核光极性；改完必须重跑 `verify_l1_missing.py` 零逃逸自检 |
+| 缺粒站判定可疑 | 二期判据只在 **40 张**样本上标定过，样本量小 | 攒更多样本复跑 `tools/verify_l1_missing.py`，**逃逸恒为 0** 才谈得上信它 |
+
+> ⚠ **`--no-uno` 绝不能进产线子进程**：带它时 IPC 照建链，但检测器此后永不调 `pulse()`，主程序一条 NG
+> 都收不到 → 判定照跑、执行器不动 = **逃逸**。只在 `--mode local` 离线跑样本时用。
 
 ## 环境
 
-一次装齐（推荐）：
-
 ```bash
-pip install opencv-python numpy requests
+python -m venv venv && source venv/bin/activate      # 产线 Ubuntu；Windows 用 .venv\Scripts\activate
+pip install opencv-python numpy pyserial              # camera 直连只用标准库 socket；串口用 pyserial
 ```
 
-也可按需安装：
+Python ≥ 3.8；OpenCV 3/4/5 均可（`findContours` 返回值已兼容）。
 
-```bash
-pip install opencv-python numpy    # 本地文件夹调试必需
-pip install requests               # 仅 `--mode http` 需要；直连(`--mode camera`)只用标准库 socket
-pip install pymodbus               # 仅对接 PLC 需要
-```
 
-Python ≥ 3.8（实测 3.14.2）；OpenCV 3/4/5 均可（`findContours` 返回值已做兼容）。
-
-## 快速开始
-
-```bash
-# 本地样本遍历（读文件头部 LOCAL_IMAGE_DIR）
-python thrust_cage_flange_inspect.py
-
-# 指定目录 + 保存叠加调试图（OK 也存）
-python thrust_cage_flange_inspect.py --dir "D:\samples" --debug
-
-# 排查：把全部兜孔都检一遍（默认只检 2 个）
-python thrust_cage_flange_inspect.py --holes 0 --debug
-
-# 上线：真直连相机取实时图判 OK/NG（10001 私有协议 + IO 外部硬触发）
-python thrust_cage_flange_inspect.py --mode camera --debug
-
-# 台上调试：改用软触发，每帧由上位机发一次执行命令
-python thrust_cage_flange_inspect.py --mode camera --trigger MainRunOnce --limit 3 --debug
-
-# 采样（标阈值/重标定用）：存原始帧 + PNG 无损 + OK 也存，一轮只放一类件
-python thrust_cage_flange_inspect.py --mode camera --collect "D:\zq\samples\直连_正"
-python dbg_report.py --dir "D:\zq\samples\直连_正" --holes 0 --sweep --truth front
-
-# 备用：监视 MJ_Aisensor 的存图目录，新图落地就判
-python thrust_cage_flange_inspect.py --mode watch --dir "D:\新建文件夹\WTX3000-360C (DA7486717)"
-
-# 换型：重新标定拐角角度与压痕尺寸
-python thrust_cage_flange_inspect.py --calib --dir "D:\新料号样本"
-```
-
-| 参数 | 说明 |
-|---|---|
-| `--mode {local,camera,watch,http}` | 取图方式，默认 `local`。`camera` = 10001 直连取实时图，`watch` = 监视存图目录，`http` 见「上线部署」 |
-| `--trigger {external,MainRunOnce,ContinuousImageCapture}` | `camera` 模式的触发方式，默认 `external`（IO 外部硬触发，被动等帧）。`MainRunOnce` = 软触发（台上调试），`ContinuousImageCapture` = 连续预览（调光） |
-| `--dir DIR` | 本地样本目录 / `watch` 的监视目录 |
-| `--ip IP` | 相机 IP（`camera` / `http` 模式用） |
-| `--debug` | 额外保存叠加调试图（OK 也存） |
-| `--collect DIR` | **采样模式**：等价于 `--save-dir DIR --no-overlay --save-ext .png` 且 OK 帧也存。⚠ 一轮只放一类件，跑完交给 `dbg_report --dir DIR --truth front\|back` |
-| `--save-dir DIR` | 存图根目录，自动在下面建 `OK/` 与 `NG/`（不给则用头部 `OK_SAVE_DIR`/`NG_SAVE_DIR`） |
-| `--no-overlay` | 存图不划线，只存原始帧。**喂 `dbg_report` 必须加这个**，否则它会去分析图上的线条 |
-| `--save-ext {.jpg,.png}` | 存图格式：`.jpg` 省空间（走 `JPEG_QUALITY`），`.png` 无损（采样用） |
-| `--calib` | 换型标定模式，打印可直接抄用的 `CORNER_SPEC` |
-| `--limit N` | 只处理前 N 张 / 前 N 帧 |
-| `--holes N` | 覆盖 `HOLE_CHECK_COUNT`，`0` = 全部孔 |
-
-## 算法流程
-
-```
-取图 (本地 / 10001 直连 / 存图目录 / HTTP)
-  ↓ 中值滤波 → CLAHE → 高斯
-HoughCircles 粗找兜孔 (阈值不足时自动降阈重找一次)
-  ↓
-工件定位  ①孔心节圆拟合  ②大圆 Hough  ③掩膜质心   ← 三级兜底
-  ↓
-孔心精定位: 360° 射线找"孔内-台面"灰度 50% 跨越点 → 圆拟合 (自动判极性)
-  ↓ 取所有孔半径中位数作统一基准 r，剔除孔径异常者
-按 "ROI 完整在视场内 → 4 拐角完整数 → 孔壁对比度" 排序，取前 2 个孔
-  ↓
-特征A: ROI 多阈值二值化 → 同心轮廓计数 → 半径聚类 → 环数 ≥ 2
-       (并行: 同心 Hough 在 [1.12,1.36]r 找翻边圆作 OR 兜底)
-特征B: 4 拐角 ROI → Hough 形状预筛 → 圆形掩膜裁剪 + 多阈值分割 → circularity > 0.75
-  ↓
-单孔 = 特征A AND 特征B      工件 = 孔1 OR 孔2  →  OK / NG
-  ↓
-NG(可选 OK) 图落盘 + 打印调试信息 + Modbus 上报
-```
-
-## 输出
-
-控制台逐帧打印工件定位信息、每孔的**原始轮廓数 / 环数 / 环半径比 / 有效压痕数 / 单孔结论**
-及 4 个拐角明细（`Y` 有效、`-` 未检出、`x` 出画面），末尾给出判定与耗时。
-
-结果图保存到 `result/NG/`、`result/OK/`，文件名格式 `时间戳_原图名_NG代码.jpg`。
-NG 代码：`NG_PART_NOT_FOUND`（找不到垫片）、`NG_HOLE_NOT_FOUND`（圆孔不足）、
-`NG_NO_FEATURE`（受检孔均无有效特征）。
-
-叠加图配色：蓝圈/蓝十字 = 节圆与工件中心，绿/红/黄圈 = 孔通过/未通过/未参与，
-青圈 = 孔 ROI 边界，品红圈 = 命中的同心环，橄榄圈 = 翻边 Hough 圆，
-绿/红/灰方框 = 拐角窗口（通过/未通过/出画面）。
-
-## 实测标定值
-
-基于 **1216×1024 存图样本**（MJ_Aisensor 存的那个取景）标定，已写入文件头部常量：
-
-| 项目 | 实测值 |
-|---|---|
-| 兜孔半径 r | ≈ 50.7 px（≈ 0.042 × 图宽） |
-| 节圆半径 / 中心 | 396.9 px / (654.4, 475.2)，11 孔拟合最大残差 4.3 px |
-| 兜孔节距 | 20.0°（整圈 18 个兜孔） |
-| 翻边外圈半径 | 1.20 ~ 1.27 × r |
-| 拐角相对角度 | −131.2°(σ1.4) / −59.4°(σ1.5) / +61.0°(σ2.0) / +130.8°(σ1.9) |
-| 拐角距离比 | 1.55 / 1.76 / 1.83 / 1.60 × r |
-| 压痕半径 | 0.28 ~ 0.55 × r（中位数 0.34） |
-
-拐角角度以"工件中心 → 孔心"的向外径向方向为 0°，因此工件旋转时 4 个拐角自动跟随，
-无需知道绝对角度。换相机或换料号后用 `--calib` 重新标定。
-
-⚠ **走 `--mode camera` 直连后，上表中的像素量要重标。** 直连帧是 **1280 × 800**（相机原生分辨率），
-存图样本是 1216 × 1024，垂直方向差 22%、可见兜孔数也不同，所以兜孔半径 50.7 px、
-节圆 396.9 px、中心 (654.4, 475.2) 这三项**不能直接搬到直连帧上**；按 `r` 写的比例量
-（拐角角度、距离比、压痕半径比、环带范围）仍成立。在直连取景下跑一次 `--calib` 补齐。
-
-2026-09-05 直连实测量到的量（**顺带量的，不是标定结果**）：兜孔半径 **40.6 ~ 40.8 px**（3 帧一致，
-= 0.0318 × 图宽）、节圆 306.8 px（9 孔拟合）。节圆/孔径比 **7.52** vs 存图样本的 7.83，只差 4%
-→ 直连取景是**整体缩到约 0.80 倍**，不是畸变。⚠ 0.0318 距 `HOLE_R_MIN_RATIO = 0.030`
-**只剩 6% 余量**，工件再远一点兜孔就会被整体筛掉（→ `NG_HOLE_NOT_FOUND`），重标时必须一起改。
-
-## 成像条件与标定绑定关系
-
-**相机参数是这套标定值的另一半，必须一起纳入版本管理**，记录模板见
-[`docs/camera_config.md`](docs/camera_config.md)（曝光/增益、光源极性、工作距离、
-JPEG 质量、触发、机内方案版本、机械取景，附换相机后的 7 步复检清单）。
-
-按 `r`（兜孔半径）比例写的常量换成像条件仍成立；下列常量**绑死在成像条件上**，相机一改就要重标：
-
-| 变化项 | 受影响常量 |
-|---|---|
-| 工作距离 / 分辨率 / binning | `HOLE_R_MIN/MAX_RATIO`、`HOLE_MIN_DIST_RATIO`、`OUTER_R_MIN/MAX_RATIO` |
-| 曝光 / 增益 / 光源 | `REFINE_MIN_CONTRAST`、`HOLE_HOUGH_P1/P2`、`FLANGE_HOUGH_P2`、`MARK_HOUGH_P2`、`CLAHE_CLIP` |
-| JPEG 质量（**仅 `watch` 模式**；`camera` 直连是无压缩灰度） | `MARK_CIRCULARITY_MIN`、`MIN_VALID_MARKS`、`RING_MIN_CONTOUR_PTS` |
-| 取景位置 | `HOLE_CHECK_COUNT`、`MIN_HOLE_COUNT` |
-
-**最敏感的不是圆度阈值本身。** 2026-09-04 拿到首张真实反面样本后实测：反面误检压痕的圆度
-**0.883**，比正面 30 个有效压痕里的 29 个都高（正面实测 0.774 ~ 0.885）。所以**提高
-`MARK_CIRCULARITY_MIN` 会先杀正面，救不了反面**——它只负责剔毛刺碎轮廓，不是正反鉴别量。
-
-真正在做正反鉴别的是每孔压痕**个数**：正面 9/10 个孔有 ≥2 个有效压痕，反面 0/4 个孔有，
-即 `MIN_VALID_MARKS = 2` 在承担全部鉴别力。JPEG 压缩伤害的也是这个数——正面 30 个压痕里
-有 5 个只在 16 个（百分位 × 极性）组合中的 1 个上过门，且全部集中在 r ≥ 0.497 的大半径命中上，
-压缩率一降先掉这批。（走 `--mode camera` 直连后拿到的是无压缩灰度，这条自变量消失。）
-
-⚠ **直连取景下这点余量已经是 0。** 2026-09-05 判 OK 的那帧，两个受检孔各**正好 2 个**有效压痕
-（半径比 0.33 / 0.44），4 个拐角里 `−59.5°` 和 `+60°` 这两个**三帧全零**。也就是说现在任何让压痕
-少检一个的改动——提 `MARK_CIRCULARITY_MIN`、把 `MARK_R_RATIO_RANGE` 上界收到 0.42 以下、
-或者亮带再重一点——都会把正面直接翻成 NG。要拿回余量只能从成像侧走（压亮带 + 按标定取景摆件）。
-
-成像侧：**当前成像条件已由直连实测确认**——曝光 320 μs / Gain 1 dB / Gamma 1.5 / Focus 456，
-1280×800 无压缩灰度，实拍单帧灰度均值 76.3、饱和像素 8.20%。建档时手抄的那一组
-（20000 μs / 4 dB / Focus 2000）与机内不符，已从文档删除。⚠ **现在最该处理的是画面中央
-一条横贯全幅的饱和亮带**（台面反光把工件切成明暗两半，2026-09-04 反面样本右半幅整片糊白、
-18 孔只检出 4 个，是同一毛病）。另有 `{"ATMode":2,"MaxExposure":500,"MaxGain":1}`，
-若 `ATMode:2` 是自动曝光，曝光会在 ≤500 μs 内浮动，`REFINE_MIN_CONTRAST` 这类灰度阈值
-就没有基准，**上线前必须确认并关掉**。下一步不是继续调阈值，而是压掉亮带 +
-按 `docs/camera_config.md` 1.7 节摆正工件 + 在直连取景下重拍正/反面并 `--calib` 重标，
-再按第 5 节清单全跑一遍。
-
-## 验证情况
-
-| 项目 | 结果 |
-|---|---|
-| **直连取图（`--mode camera`）** | 2026-09-05 多轮实跑（软触发 3 帧 ×2 轮、被动 IO 模式 1 / 3 / 5 帧各一轮）：每帧 **1024000 字节完整解开 = 1280×800 灰度**、reshape 后无错位，**无效帧 0**，0.3 ~ 0.65 s/帧。取图链路通了 |
-| **IO 外部硬触发** | ✅ 2026-09-05 复验通过。MJ 设「外部触发 / 触发源 IO / `LINE_IN0` / 上升沿 / 延迟 0 ms / 防抖 10000 μs」，算法走默认 `external`（只回心跳）：**不放件空等 92 s 收 0 帧**，**给 3 次到位信号收到恰好 3 帧**（间隔 6 s / 8 s = 给信号的节奏）。改之前同样不发命令时是 5 帧 / 1.54 s ≈ 3 帧/s 自由连跑 |
-| **直连实时帧的判定** | 2026-09-05 15:27 那 3 帧：**1 帧判 OK**（`CAM#000002`：9 孔 `pitch_fit`，2 个受检孔双特征全过，翻边 Hough 1.17 / 1.22 r，每孔 2 个有效压痕 circ 0.87 ~ 0.88，98.2 ms）——**直连实时帧第一次判出 OK**，整条链打通；另 2 帧工件没摆到位（有效孔 5 / 2，一帧退 `boundary_circle`）判 `NG_NO_FEATURE`。⚠ **还不能上线**：孔径 40.6 ~ 40.8 px（0.0318 图宽）vs 标定 50.7 px（0.042），距 `HOLE_R_MIN_RATIO` 下限只剩 6%；4 个拐角只有 ±131° 两个命中（2/4，**正好等于 `MIN_VALID_MARKS`，零余量**），存图样本正面是 83.3%。取景与那条饱和亮带仍是主要问题 |
-| 真实正面（1 张） | 10 个兜孔中 9 个双特征全过，判定 OK；2 孔模式 154 ms / 全 10 孔 267 ms |
-| 真实反面（1 张） | 判定 NG（`NG_NO_FEATURE`，码正确）。但 **4/4 孔误过特征A**，1 个拐角误检出压痕（circ 0.883），**距翻判只差 1 个压痕**；该图右半幅过曝，18 孔只检出 4 个，节圆由同侧 4 孔拟合属病态 |
-| 特异性对照 | 47 个"确定无压痕"位置 **0 误命中**；真实反面 12 个画面内拐角 **1 个误命中**（8.3%） |
-| 合成样本 | 正/反面 × (基准、旋转+偏移、强噪声) + 空白无工件，**7/7 判定正确**，反面走 `NG_NO_FEATURE` |
-
-## 已知限制
-
-1. **真实样本只有正反各 1 张**，且反面那张成像不合格：右半幅过曝、18 孔只检出 4 个、节圆由 4 个
-   同侧孔心拟合（病态），拐角径向基准随之偏移并产生 4 个 `gate_miss`。它的 NG 有一部分来自定位
-   失效而非特征缺失——**对的结论、错的理由，不能用来标阈值**。顺序是：先压掉饱和亮带、
-   在直连取景下重拍反面，再补 ≥20 张反面 + ≥10 张边界样本（漏冲压痕、油污遮挡、严重毛刺）。
-   本地样本文件名要带 `正`/`反`（或 `front`/`back`），否则 `guess_label()` 推不出真值，
-   `dbg_report.py --sweep` 的阈值网格只会显示 `0/0`。走 `camera` 直连时帧名是 `CAM#序号`
-   / `CAM_<相机时间戳>`，同样推不出真值——**不用重命名**：按轮次分目录采
-   （`--collect "…\直连_正"`、`--collect "…\直连_反"`），分析时用 `dbg_report --truth front|back`
-   强制真值。铁律是**一轮只放一类件**，`--truth` 是整目录一刀切的。
-2. **"外圆定位"改为节圆定位**：样本中垫片外圆在视场外（工件仅上半幅进入画面），
-   照字面找外圆会失败。外圆 Hough 仍保留为二级兜底。
-3. **特征A 目前没有鉴别力**：真实样本上正面 10 孔 + 反面 4 孔，**14/14 全部通过特征A**。
-   反面有 3 个孔在 1.334 r 被翻边 Hough 误命中（`FLANGE_HOUGH_BAND` 上界是 1.36），
-   第 4 个孔从轮廓分支过（单圈冲裁边的内、外沿被计成 2 圈）。于是
-   `HOLE_LOGIC = "AND"` 实质退化为只有特征B 在判，"双特征联合"名不副实；
-   **`HOLE_LOGIC` 更不能改成 `OR`**，那样特征A 会单独把反面放过去。
-   收窄 `FLANGE_HOUGH_BAND` 上界到约 1.28 可去掉那 3 个误命中，但救不回第 4 个。
-
-## 参数调整
-
-所有阈值集中在文件头部 10 个分节：取图、预处理、圆孔粗定位、工件定位、孔心精定位、
-特征A、特征B、判定逻辑、调试存图、Modbus。常见误判对应参数：
-
-| 现象 | 优先调整 |
-|---|---|
-| 找不到工件/圆孔 | `HOLE_R_MIN/MAX_RATIO`、`HOLE_HOUGH_P2`、`HOLE_HOUGH_P2_FALLBACK` |
-| 正面误判 NG，拐角框位置偏 | `--calib` 重标 `CORNER_SPEC`；放宽 `MARK_CENTER_GATE` |
-| 正面误判 NG，框位置对但圆度低 | `MARK_HOUGH_P2` 调小。⚠ **`MIN_VALID_MARKS` 不要降到 1**：实测反面已有 1 个误检压痕，降到 1 会让反面直接判 OK；放宽 `MARK_R_RATIO_RANGE` 同理，误检全在大半径端 |
-| 反面误判 OK | 收窄 `MARK_R_RATIO_RANGE` 上界（反面 2 个误检/擦边命中都在 ≥0.45 r）、收窄 `FLANGE_HOUGH_BAND` 上界到 1.28、`MIN_VALID_MARKS` 提到 3。⚠ **别靠提 `MARK_CIRCULARITY_MIN`**，实测它先杀正面 |
-| 油污/铁屑导致误检 | `MEDIAN_BLUR_K` 3→5、`RING_MIN_ANGLE_COVER`、`RING_MIN_CONTOUR_PTS` |
-
-## 上线部署
-
-### 产线通路：`--mode camera` 真直连（推荐，2026-09-05 已跑通）
-
-走厂家 **10001 端口私有协议**：相机把**无压缩 8 位灰度帧直接推给算法**，不落盘、不过 JPEG。
-实现见 `thrust_cage_flange_inspect.py` 的 `Wtx10001Source`。
-改文件头部第 1 节即可固定配置，无需命令行参数：
-
-```python
-SOURCE_MODE       = "camera"
-CAMERA_IP         = "169.254.44.201"
-CAMERA_PORT       = 10001
-CAM_TRIGGER_ORDER = "external"       # IO 外部硬触发(上线)。台上调试可改 "MainRunOnce" 走软触发
-CAM_EXT_WAIT_S    = 0.0              # external 等触发的超时；0 = 一直等（上线用）
-CAM_IMG_W, CAM_IMG_H = 1280, 800     # 相机原生分辨率，一帧恰好 1024000 字节
-CAM_MAX_FRAMES    = 0                # 0 = 一直取（上线用）
-PRINT_DEBUG       = False            # 节拍紧时关闭打印
-SAVE_OVERLAY      = False            # 只存原图，省时间
-```
-
-### 触发方式：上线必须是 IO 外部硬触发
-
-| `CAM_TRIGGER_ORDER` / `--trigger` | 上位机行为 | 用途 |
-|---|---|---|
-| **`external`（默认，上线）** | **只回心跳，被动等相机推帧**；不发 `MainRunOnce`、不发 `StopRun`、两帧之间不清积压 | 工装到位信号直接触发相机曝光，**一个触发沿 = 一件 = 一帧**，结构上不可能判到上一件，也不会拍到运动中的件 |
-| `MainRunOnce` | 每帧发一次执行命令，收到整帧后立刻 `StopRun`；触发前清积压 | 台上调试。⚠ 实测发一次相机会**一直出图**（≈0.8 fps）直到 `StopRun`，拍照时刻与工件到位无关，**不能上线** |
-| `ContinuousImageCapture` | 发一次连续预览命令（≈6.25 fps） | 调光、压饱和亮带时看图用，不用于判定 |
-
-⚠ **用过 `--trigger MainRunOnce` 之后，相机会被收尾的 `StopRun` 停住。** 实测：软触发跑完再切回
-`external`，23 s 收 0 帧。这时要在 MJ 里把方案重新置为运行态（或再发一次软触发）才会出图。
-`external` 模式自己从不发 `StopRun`，所以上线运行不会造成这个状态——这也反过来验证了被动模式
-**真的没有自己触发相机**。
-
-✅ **相机侧「触发源」已在 MJ 界面上设成 IO 硬触发并复验通过**（2026-09-05：外部触发 / 触发源 IO /
-触发信号 `LINE_IN0` / 上升沿 / 触发延迟 0 ms / IO 防抖 10000 μs）。这个设置算法改不了
-（10001 口写参数的命令名还没抓到，见 `docs/camera_config.md` 1.8.2），只能在 MJ 里改。
-
-复验数据：**不放件空等 92 s 收到 0 帧**（每 30 s 打一行「等触发信号中」，说明链路与心跳都活着），
-**给 3 次到位信号收到恰好 3 帧**，帧间隔 6 s / 8 s = 给信号的节奏。对比改之前——同样一条命令都不发，
-相机 5 帧只用 1.54 s（≈3 帧/s 自由连跑）。每次在 MJ 里动过触发设置、或用过 `--trigger MainRunOnce`
-之后，都按这两步重做一遍：
-
-```bash
-# 不放件：应当停在 "[INFO] 等触发信号中..." 不出帧
-python thrust_cage_flange_inspect.py --mode camera --debug
-# 再给 N 次工装到位信号：应当恰好多出 N 帧
-```
-
-⚠ IO 触发下随图 JSON **不带 `ImageName`**（软触发时带），帧名会退回 `CAM#序号`；与相机侧对帐要用
-落盘文件名里的**本机**时间戳，例如 `result/OK/20260905_152733_CAM#000002_OK.jpg`。
-
-节拍：实测 **0.3 ~ 0.65 s/帧**（帧到手 → 判完，含 1024000 字节传输），其中算法本身 77 ~ 212 ms
-（兜孔候选多时可到 1.5 s）。传输速率实测 1.9 MB/s 是瓶颈，理论上限 ≈ 1.8 帧/s；IO 触发比这更快时
-帧会在 socket 缓冲里排队，按到达顺序逐件判，不丢件。
-
-PLACEHOLDER_PROTOCOL_BULLETS
-
-协议要点（端口清单、命令表、可写参数、图像格式实测见
-[`docs/camera_config.md`](docs/camera_config.md) 第 1.8 节）：
-
-- 记录格式（控制帧与图像块同构）：`+0` 魔数 `AA55ABCD`、**`+7` u16 小端 = 载荷长度（唯一可靠的
-  长度字段）**、`+10` `0x03`=图像块 / `0x00`=控制帧、`+13` u16 小端块序号、`+17` u16 小端随图 JSON
-  长度、`+50` 载荷、尾 2 字节校验。⚠ 偏移 4 的大端 u32 只在纯 JSON 控制帧上等于载荷长度，
-  图像块上恒为 20——早期把它当长度字段是错的
-- 一帧 = **788 个块**（序号 0..787 连续），常规块载荷 1300 字节、末块 1263 字节（短于常规块 =
-  帧尾标志），块 0 载荷 = 结果 JSON（363 字节）+ 像素；像素合计 **1024000 = 1280 × 800**，
-  reshape 后无错位、不需要任何补偿（早期从丢包的 pcap 量出的"行跨距 1332"是假结论，已作废）
-- **必须回心跳**：约 1 s 一条 `{"CommuniInfo":{"PortCode":"Smsocket3"},"Order":"HeartBeat"}`
-  （`CAM_HEARTBEAT_S`）。只连上不回话，相机推 5~6 条后主动断开
-- 单帧超时（`CAM_GRAB_TIMEOUT_S`）按无效帧处理并继续，连接断开自动重连 `CAM_RECONNECT_TRY` 次，
-  都不会退出程序
-- 随图 JSON 里的 `NGResult` / `Success` 是**机内方案**的判定，与本算法无关，别混用；`ImageName`
-  是相机侧时间戳，算法拿它当帧名（`CAM_<时间戳>`）便于对帐
-- **曝光/增益/Gamma/焦点/光源/触发源整组参数都能从这个口写下去**，也就是能脚本化做曝光扫描
-  （`MaxExposure` 39000 μs / `MaxGain` 255 / `MaxLens` 1023）——⚠ 但写参数的命令名还没抓到，
-  要做扫描得先补抓一次
-
-⚠ **`--mode http` 走不通**：80 端口拒绝连接（WinError 10061），这台相机没有 HTTP 服务。
-
-### 备用通路：`watch` 监视存图目录
-
-MJ_Aisensor 照常存图，算法监视存图目录，新图落地就判。好处是压缩质量与标阈值用的样本完全一致，
-代价是多一次落盘：
-
-```python
-SOURCE_MODE     = "watch"
-LOCAL_IMAGE_DIR = r"D:\新建文件夹\WTX3000-360C (DA7486717)"   # = 存图目录
-WATCH_SKIP_EXISTING = True    # 启动时的存量图算已处理，只等新图
-WATCH_IDLE_TIMEOUT_S = 0.0    # 0 = 一直等（上线用）；>0 = 空闲这么多秒就退出（调试用）
-PRINT_DEBUG     = False       # 节拍紧时关闭打印
-SAVE_OVERLAY    = False       # 只存原图，省时间
-```
-
-`watch` 模式的三点约定：
-
-- **只读不删。** 存图目录同时是样本库，删图会毁掉标阈值要用的样本。去重靠内存里的 `seen` 集合，
-  重启后按 `WATCH_SKIP_EXISTING` 决定是否重跑存量
-- **防半张图。** 文件大小连续两次（间隔 `WATCH_SETTLE_S`）不变才读，避免拿到只写了一半的 JPEG
-- **按到达顺序判。** 按 mtime 排序，不按文件名（存图名不保证单调递增）
-
-⚠ **`watch` 的前提是 MJ 真的在存图。** 2026-09-05 实测：在 MJ 里点了 3 次「执行」，
-存图目录里**一张新图都没多**（存图开关或存图条件不满足）。上线前先手工确认
-「点一次执行 → 目录里多一张图」这条链通，否则算法会一直空等。
-
-`Ctrl-C` 是正常停机方式，会打完汇总再退出；`camera` 模式退出前会发一条 `StopRun` 再断开，
-不会把相机留在连续出图状态。
-
-`http` 模式保留给开放了 HTTP 的机型，取图失败自动重试 3 次，仍失败按 NG 处理并继续下一帧，
-不会退出。⚠ 头部 `HTTP_USE_SYSTEM_PROXY = False` 别改回 `True`：本机装了系统代理
-（127.0.0.1:7892），`requests` 默认会读 Windows 代理设置，把 169.254.x.x 也发给代理，
-症状是莫名的 `ReadTimeout` 而不是连接失败。
-
-### ⚠ 取图通了 ≠ 可以判定
-
-2026-09-05 15:27 那轮 3 帧里，**摆到位的那 1 帧判出了 OK**，另 2 帧因为工件没摆到位判 NG——
-链路和算法都是通的，卡在**成像条件与摆放**上。上线前按顺序做完这几件：
-
-1. 按 [`docs/camera_config.md`](docs/camera_config.md) 1.7 节把工件摆到与标定样本一致的位置
-   （3 帧里只有 1 帧到位，这是当前第一大问题）
-2. ✅ **已完成**：MJ 里「触发源」= IO 硬触发（`LINE_IN0` / 上升沿 / 延迟 0 ms / 防抖 10000 μs），
-   并已复验"不给信号不出帧、给 N 次信号出 N 帧"。之后每次动过触发设置都要照上面两步重验
-3. 压掉画面中央那条饱和亮带（降曝光 / 改光路 / 加偏振）——4 个拐角里 `−59.5°` / `+60°` 这两个
-   **三帧全都检不出压痕**，有效压痕数正好卡在 `MIN_VALID_MARKS = 2` 的零余量上，亮带是嫌疑之一
-4. 确认 `ATMode:2` 是不是自动曝光，是就关掉——否则灰度阈值没有基准
-5. 在直连取景下跑 `--calib` 重标几何量（1280×800 ≠ 1216×1024；实测孔径 40.7 px vs 标定 50.7 px，
-   整体缩到约 0.80 倍，`HOLE_R_MIN_RATIO` 只剩 6% 余量），并重采 ≥20 正 + ≥20 反 + ≥10 边界样本，
-   文件名带 `正`/`反`
-6. 按 `docs/camera_config.md` 第 5 节清单从第 0 步开始逐步复检，每步不过就别往下走
-7. 查清 `result\` 是谁删的：2026-09-05 两轮实跑之后整个 `D:\zq\result\` 都自行消失了（算法只创建和
-   写入、从不删除），大概率是本机的清理软件。上线前加白名单或把存图目录挪出清理范围，
-   否则现场留不下 NG 证据
-
-PLC 对接：`pip install pymodbus`，解开文件末 `ModbusReporter` 类 docstring 中的实现代码，
-置 `ENABLE_MODBUS = True` 并配好线圈/寄存器地址。建议 PLC 采用上升沿 + 应答清零握手，
-不要依赖视觉端延时，否则节拍变化时会漏信号。
-
-## 建议的 .gitignore
-
-样本图片含客户零件信息，不要整目录入库；但 `docs/ref/` 下的基准图是复现标定的前提，
-确认不含敏感信息后单独放开（直连帧存 PNG 无损，所以两种后缀都要放开）：
-
-```gitignore
-__pycache__/
-*.pyc
-.venv/
-.idea/
-result/
-samples/
-*.jpg
-*.bmp
-*.png
-!docs/ref/*.jpg      # 存图取景的基准图
-!docs/ref/*.png      # 直连取景的基准图（1280×800 无压缩灰度）
-```
 
 
