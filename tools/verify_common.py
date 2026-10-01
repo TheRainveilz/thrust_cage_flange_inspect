@@ -47,9 +47,11 @@ DEFAULT_MISSING_DIR = os.path.join(PROJECT_ROOT, "datasets", "缺粒样本")
 # 交叉验证过的黄金基线(`datasets/flange` 的 {OK,NG} 两个子目录，`--holes 0`)。
 # 只在跑到这个数据集时才断言 —— 换数据集这些数字没有意义。
 GOLDEN_FRONT = {
-    "OK": {"processed": 352, "n_ok": 318, "n_ng": 34},   # 正面：318/352，34 过杀(可接受)
+    "OK": {"processed": 352, "n_ok": 323, "n_ng": 29},   # 正面：323/352，29 过杀(可接受)
     "NG": {"processed": 623, "n_ok": 0, "n_ng": 623},    # 反面：623/623 零逃逸
 }
+# 2026-10-01: 节圆 RANSAC 加候选半径上界(PITCH_FIT_MAX_R_RATIO×中位孔半径, 主路径+锚定路径
+#   两处)后, 正面 318→323(+5 救回: 原本坏节圆把孔判成"不在节圆上"被前置闸否决), 反面零逃逸不变。
 
 
 def _detail(text: str) -> str:
