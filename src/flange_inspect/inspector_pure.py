@@ -107,7 +107,7 @@ CAM_VALIDATE_RECORD_CHECKSUM = False  # B 方案(2026-09-20 关, 可回退)：�
 CAM_TCP_NODELAY = True  # B 方案(可回退)：关 Nagle, 主要影响我方 ACK 及时性, 近乎零成本。回退: 设 False。
 CAM_RX_PROBE = True  # A 方案(可回退)：RX 探针。统计 recv 最大间隔(GIL 被 inspect 饿死的直接证据),
 #   在 [SUMMARY] 打 rx_gap_max_ms / rx_recv_calls。定位"接收慢"是 CPU 还是 GIL 用, 稳定后可设 False。
-RESULT_DEADLINE_MS = 300.0  # 超时预算：图像入队 → 算法判定（含排队+BGR+inspect，不含网络取图/存图 IO）；须按现场速度/喷嘴距离实测修订
+RESULT_DEADLINE_MS = 200.0  # 超时预算：图像入队 → 算法判定（含排队+BGR+inspect，不含网络取图/存图 IO）；须按现场速度/喷嘴距离实测修订
 TIMEOUT_ESCALATE_N = 15  # 连续超时达到该次数升级停线；0=永不自动停(纯 fail-safe)
 TIMING_RECENT_WINDOW = 200  # p95 只统计最近这些帧，避免长期运行内存增长
 
@@ -161,6 +161,9 @@ PITCH_FIT_ITERS = 6  # 节圆稳健拟合的重加权迭代次数(逐次剔离�
 PITCH_FIT_TOL_RATIO = 0.06  # 内点容差 / 节圆半径
 PITCH_FIT_TOL_MIN_PX = 8.0  # 内点容差下限(px)
 PITCH_FIT_RANSAC_MAX_COMBOS = 4000  # 节圆 RANSAC 枚举 3 点子集的上限; 超过则用固定种子抽样(可复现)
+PITCH_FIT_MAX_R_RATIO = 11.0  # 节圆半径上限 / 中位孔半径。按**孔径**归一化而不是按图宽: 节圆半径/孔径
+#   是零件本身的几何常数, 与工作距离、分辨率无关, 换成像条件不用重标。实测该比值 ≈8.0
+#   (节圆 295px / 孔半径 37px), 留 ~38% 余量取 11。作用见 fit_circle_ransac 的 r_ceil。回退: 传 None。
 OUTER_R_MIN_RATIO = 0.18  # 兜底: 外圆/中心大孔 Hough 半径范围 / 图像宽度
 OUTER_R_MAX_RATIO = 0.60  # 兜底外圆半径上限 / 图像宽度(与上面的 MIN 一起框定搜索范围)
 OUTER_HOUGH_P2 = 90  # 兜底外圆 Hough 累加器阈值: 比孔用的更高, 只认证据充分的大圆, 防误检
@@ -249,7 +252,7 @@ FEATURE_B_DISABLE_SOFT_ACCEPT = False  # 特征B 兜底开关(可回退)。False
 #   去掉宽松兜底。#128/#444 那类临界压痕就是从这条兜底溜过的; 设 True 可清零该类逃逸但会动召回。回退: 设 False。
 
 # ---------- 8. 判定逻辑 ----------
-HOLE_CHECK_COUNT = 0  # 参与判定的孔数(按质量排序取前 N); 0 = 全部孔(产线默认, 黄金基线 318/352 & 反面 623/623 0逃逸就是在全孔下验证的)。>0 仅供快速抽样调试, 会脱离已验证配置, 勿用于产线。
+HOLE_CHECK_COUNT = 0  # 参与判定的孔数(按质量排序取前 N); 0 = 全部孔(产线默认, 黄金基线 323/352 & 反面 623/623 0逃逸就是在全孔下验证的)。>0 仅供快速抽样调试, 会脱离已验证配置, 勿用于产线。
 HOLE_LOGIC = "AND"  # 单孔内 特征A 与 特征B 的组合: "AND"(双特征联合, 勿改) / "OR"
 PART_LOGIC = "OR"  # 孔之间: "OR" = 任一孔满足即 OK (按需求 5)
 PART_MIN_PASS_HOLES = 1  # PART_LOGIC="OR" 下, 需要多少个受检孔同时(A&B)通过才判 OK(可回退)。
@@ -609,12 +612,15 @@ def count_circle_inliers(pts: np.ndarray, cx: float, cy: float, r: float,
 
 def fit_circle_ransac(pts: np.ndarray, iters: int, tol_ratio: float, tol_min: float,
                       min_pts: int, r_floor: float,
-                      max_combos: int) -> Optional[Tuple[float, float, float, int]]:
+                      max_combos: int,
+                      r_ceil: Optional[float] = None) -> Optional[Tuple[float, float, float, int]]:
     """真 RANSAC 圆拟合: 枚举 3 点子集取最大共识集, 再对共识集迭代重拟合。
 
     与 fit_circle_robust 的关键差别: **报出的内点数永远是返回圆的真实内点数**(用它自己的
     容差重新数一遍), 支撑不足 min_pts 就返回 None。这样"内点数"才配当接受条件用。
     抽样用固定种子 -> 同一张图每次跑结果一致(判定必须可复现)。
+
+    r_ceil: 候选圆半径上界(px), None = 不限(旧行为)。**必须有上界**, 理由见下面 valid 处。
     """
     pts = pts.astype(np.float64)
     n = len(pts)
@@ -646,6 +652,14 @@ def fit_circle_ransac(pts: np.ndarray, iters: int, tol_ratio: float, tol_min: fl
         ccy = (sa * (cx3 - bx) + sb * (ax - cx3) + sc * (bx - ax)) / det
         ccr = np.hypot(ccx - ax, ccy - ay)
     valid = np.isfinite(ccx) & np.isfinite(ccy) & np.isfinite(ccr) & (ccr > r_floor)
+    if r_ceil is not None:
+        # 上界与下界必须成对。内点容差是**相对半径**的(tol = max(0.06*r, 8px)), 于是候选半径越
+        # 荒唐、它的容差就越荒唐: 三个近乎共线的孔心的外接圆能到上万 px(图宽才 1280), 容差跟着涨到
+        # 600px, 一帧里几乎每个孔都"贴"在它上面 -> 这个假大圆靠票数在 argmax 里压过真节圆; 随后
+        # 共识重拟合把半径拉回几百 px、容差收紧到十几 px, 共识瞬间塌到 < min_pts -> 整个拟合返回
+        # None(不是"没有圆", 是圆被假圆挤掉了)。实测 975 帧里 344 帧栽在这上面(反面 NG 占 47%),
+        # 这些帧的冠军半径 100% 超过 480px, 而同一个点集里真实节圆(295px)一直都在。
+        valid &= (ccr <= r_ceil)
     # 每个候选圆的真实内点数(容差与 count_circle_inliers 完全一致: 逐候选 max(ratio*r, min), 严格 <)
     dist = np.hypot(pts[:, 0][None, :] - ccx[:, None], pts[:, 1][None, :] - ccy[:, None])  # (M,n)
     tol_m = np.maximum(tol_ratio * ccr, tol_min)
@@ -665,6 +679,8 @@ def fit_circle_ransac(pts: np.ndarray, iters: int, tol_ratio: float, tol_min: fl
         nx, ny, nr = fit_circle_lsq(pts[keep])
         if not np.isfinite((nx, ny, nr)).all() or nr <= r_floor:
             break
+        if r_ceil is not None and nr > r_ceil:
+            break  # 上界不能只在初选生效, 否则重拟合又能把圆漂出去
         cx, cy, r = nx, ny, nr
     k = count_circle_inliers(pts, cx, cy, r, tol_ratio, tol_min)
     if k < min_pts:
@@ -674,7 +690,8 @@ def fit_circle_ransac(pts: np.ndarray, iters: int, tol_ratio: float, tol_min: fl
 
 def fit_pitch_anchored(pts: np.ndarray, seed_cx: float, seed_cy: float, r_floor: float,
                        tol_ratio: float, tol_min: float, min_pts: int, iters: int,
-                       max_combos: int) -> Optional[Tuple[float, float, float, int]]:
+                       max_combos: int,
+                       r_ceil: Optional[float] = None) -> Optional[Tuple[float, float, float, int]]:
     """外圆中心已知时的节圆拟合 —— 把 3 点 RANSAC 降成"半径投票 + 干净子集重拟合"。
 
     孔阵与工件外圆同心, 所以外圆中心是节圆中心的可靠先验。有了中心, 节圆只剩 1 个自由度
@@ -685,6 +702,8 @@ def fit_pitch_anchored(pts: np.ndarray, seed_cx: float, seed_cy: float, r_floor:
       3) 复核真实内点数, 不足 min_pts 就返回 None(退回否决, 绝不放宽)。
     安全方向: 第 3 步与主路径同样自证内点数, 不会比主 RANSAC 更容易接受一个假节圆; seed
     中心即便被视场切偏, 第 2 步重拟合也会把中心拉回内点的最小二乘解。
+    r_ceil: 透传给第 2 步的 fit_circle_ransac 作候选半径上界(与主路径同一道闸)。半径投票那一步
+      本身已被 seed 中心+r_floor 约住, 但重拟合仍可能漂出去, 所以上界也要带着一起下去。
     """
     pts = pts.astype(np.float64)
     if len(pts) < min_pts:
@@ -700,7 +719,7 @@ def fit_pitch_anchored(pts: np.ndarray, seed_cx: float, seed_cy: float, r_floor:
     if best_inl is None or best_cnt < min_pts:
         return None
     return fit_circle_ransac(pts[best_inl], iters, tol_ratio, tol_min,
-                             min_pts, r_floor, max_combos)
+                             min_pts, r_floor, max_combos, r_ceil=r_ceil)
 
 
 def odd(v: float, lo: int = 3) -> int:
@@ -1825,7 +1844,8 @@ def locate_part(work: np.ndarray, cand: np.ndarray,
         # 让一个毫无支撑的假圆被当成节圆接受(反面 69% 的图踩过)。
         fit = fit_circle_ransac(ring_pts, PITCH_FIT_ITERS, PITCH_FIT_TOL_RATIO,
                                 PITCH_FIT_TOL_MIN_PX, PITCH_FIT_MIN_HOLES,
-                                1.5 * r_med_ring, PITCH_FIT_RANSAC_MAX_COMBOS)
+                                1.5 * r_med_ring, PITCH_FIT_RANSAC_MAX_COMBOS,
+                                r_ceil=PITCH_FIT_MAX_R_RATIO * r_med_ring)
         if fit is not None:
             cx, cy, pr, n_in = fit
             if pr > 1.5 * r_med_ring and n_in >= PITCH_FIT_MIN_HOLES:
@@ -1846,7 +1866,8 @@ def locate_part(work: np.ndarray, cand: np.ndarray,
             anch = fit_pitch_anchored(ring_pts, float(bx), float(by), 1.5 * r_med_ring,
                                       PITCH_FIT_TOL_RATIO, PITCH_FIT_TOL_MIN_PX,
                                       PITCH_FIT_MIN_HOLES, PITCH_FIT_ITERS,
-                                      PITCH_FIT_RANSAC_MAX_COMBOS)
+                                      PITCH_FIT_RANSAC_MAX_COMBOS,
+                                      r_ceil=PITCH_FIT_MAX_R_RATIO * r_med_ring)
             if anch is not None:
                 acx, acy, apr, an_in = anch
                 if apr > 1.5 * r_med_ring and an_in >= PITCH_FIT_MIN_HOLES:
