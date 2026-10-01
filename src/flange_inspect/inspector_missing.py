@@ -35,6 +35,7 @@ Hough 候选常年整片是伪圆，每帧都掉进 locate_part 的全幅大半�
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import time
@@ -407,8 +408,8 @@ def inspect_missing(bgr: np.ndarray, name: str = "") -> MissingResult:
 
 
 # ============================  取图/驱动  ============================
-def _apply_dirs() -> None:
-    """把本站的目录常量打到 inspector_pure 模块上，实现两站目录隔离。
+def _apply_dirs(args: argparse.Namespace) -> None:
+    """把本站的目录常量与存图开关打到 inspector_pure 模块上，实现两站隔离。
 
     **必须在 setup_runtime_logging() 和构建取图源之前做**：那些函数里的
     RUNTIME_LOG_DIR / OK_SAVE_DIR / NG_SAVE_DIR / RAW_SAVE_DIR 都是 inspector_pure 的
@@ -418,6 +419,13 @@ def _apply_dirs() -> None:
     ip.OK_SAVE_DIR = OK_SAVE_DIR
     ip.NG_SAVE_DIR = NG_SAVE_DIR
     ip.RAW_SAVE_DIR = RAW_SAVE_DIR
+    # 上面四个只改"存到哪儿"；RAW **开不开**是 SAVE_RAW_IMAGE 这个独立开关。
+    # 必须在 build_source() 之前设：RAW 存图器是 Vn2000Source.__init__ 构造时建的
+    # (inspector_pure.py:1086 `RawFrameSaver() if (SAVE_RAW_IMAGE and ...) else None`)，
+    # 构造完再打开就晚了 —— 第一帧不会落盘。语义与第一站 inspector_pure.main() 的
+    # `if args.debug: SAVE_RAW_IMAGE = True` 对齐(见 inspector_pure.py:3056)。
+    if args.debug:
+        ip.SAVE_RAW_IMAGE = True
 
 
 def build_source(args: argparse.Namespace):
@@ -471,9 +479,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ip.CAM_TRIGGER_ORDER = args.trigger
     if args.limit > 0:
         ip.CAM_MAX_FRAMES = args.limit
-    _apply_dirs()  # 必须在 setup_runtime_logging() 之前：否则日志写进第一站的目录
+    _apply_dirs(args)  # 必须在 setup_runtime_logging()/build_source() 之前：目录隔离 + --debug 开 RAW
     setup_runtime_logging()
     log = RUNTIME_LOGGER
+    if args.debug:
+        # --debug 承诺的"逐兜孔明细进日志"是 [SLOT] 那些 RUNTIME_LOGGER.debug() 行
+        # (见 inspect_missing 内的 SLOT 明细)，默认 INFO 级别下打不出来，必须降 logger 门槛。
+        # 与 inspector_pure.py:3059 同义。--quiet 抬的是控制台 handler、--debug 降的是 logger，
+        # 两者正交：`--quiet --debug` = 明细只进文件、不刷屏(正是产线组合)。
+        log.setLevel(logging.DEBUG)
     log.info("[MISSING] 第二站=兜孔缺粒 | 日志=%s | 结果图 OK=%s / NG=%s | 判定经主程序开闸 D9(放 NG 件落盒)",
              RUNTIME_LOG_DIR, OK_SAVE_DIR, NG_SAVE_DIR)
     log.info("[MISSING] 二期判据已用 40 张样本标定(良品 3/3 判 OK、缺粒 37/37 判 NG、逃逸 0)："
