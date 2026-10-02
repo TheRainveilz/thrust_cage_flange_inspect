@@ -1,0 +1,31 @@
+帧 20260928.180428.874.000001.origin.png  work=(800, 1280)
+
+---- 固定开销 ----
+np.uint8(1280x800).astype(float32)  :  0.851 ms
+np.float32(1280x800).astype(float32):  0.646 ms
+cv2.resize 1/2 INTER_AREA           :  0.027 ms
+cv2.resize 1/4 INTER_AREA           :  0.415 ms
+
+---- refine_hole 一次(现路径 vs 已是 float32 的输入) ----
+refine_hole(work uint8)   :  1.242 ms
+refine_hole(gray_f float32):  1.175 ms
+  ⇒ 单次省 0.725 ms；×34.6 次/帧 = 4.3 ms/帧
+
+---- 找孔候选 HoughCircles 不同分辨率 ----
+  fx=1.00  (800, 1280)  r=[38,83] minDist=76
+     dp=1.0   11.60 ms   候选 0
+     dp=2.0  127.20 ms   候选 0
+  fx=0.50  (400, 640)  r=[19,41] minDist=38
+     dp=1.0    3.89 ms   候选 0
+     dp=2.0   25.88 ms   候选 0
+  fx=0.25  (200, 320)  r=[9,20] minDist=19
+     dp=1.0    0.97 ms   候选 0
+     dp=2.0    0.98 ms   候选 0
+
+---- 高光量测的掩膜/分位开销(单槽) ----
+  half=31 -> patch 63x63
+  实际 patch=(62, 62)
+  mgrid+hypot 建掩膜  : 0.0317 ms
+  np.percentile(99)   : 0.0225 ms
+  np.median           : 0.0111 ms
+  ⇒ 单槽 0.065 ms × 18 = 1.16 ms/帧
