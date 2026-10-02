@@ -33,10 +33,29 @@ Hough 候选常年整片是伪圆，每帧都掉进 locate_part 的全幅大半�
 ⚠ **仍待做的事**：`datasets/缺粒样本/` 只有 40 张，2026-10-02 换成 `I:\data.zip\data\missing\Class`
 的 598 张(正面OK 423 / 正面NG 44 / 反面NG 44 / 无件 87)复跑标定。样本量仍然不算大(尤其反面只有
 44 张)，上线前应再攒样本复跑，且零逃逸自检每次都要过(逃逸恒为 0 才谈得上上线)。
-已知未修的一处：节圆 RANSAC 偶尔锁定到**中心内孔**(实测 4/423 张正面OK，拟合半径 270/331/359/475
-而真值 ~316，相位一致性掉到 0.34~0.75，`--debug` 叠加图随之画歪)。这些帧目前被孔级高光闸判 NG，
-即过杀。正解是把相位一致性加进 tier1 的接受条件、不过就退回 tier2，但**不能直接抬
-`PITCH_FIT_MIN_HOLES`**(实测抬到 6 只救回一半、净过杀反而上升；抬到 8/10 会把好帧弄成定位失败)。
+一处曾经"已知未修"、**已于 2026-10-02 修掉**的定位缺陷，根因与当初的猜测不同，记下以免重蹈：
+现象是节圆 RANSAC 偶尔锁定到假圆(实测 4/423 张正面OK，拟合半径 270/331/359/475 而真值 ~316，
+相位一致性掉到 0.20~0.77，`--debug` 叠加图随之画歪)。当初猜的正解"把相位一致性加进 tier1 接受
+条件"是**错的**。真根因是 **tier1 漏传了候选半径上界 `r_ceil`**(第一站 locate_part 两处都传了，
+这份为第二站抄的副本没有)：内点容差是相对半径的(tol = 0.06*r)，三个近乎共线的孔心外接出上万 px
+的假大圆、容差跟着涨到几千 px(比整张图还大)，靠票数在 argmax 里压过真节圆；随后共识重拟合把半径
+拉回中等值、内点塌到 4~5 个，而 `PITCH_FIT_MIN_HOLES=3` 恰是三点抽样的最小样本数、任何三点圆都
+天然满足 -> tier1 一路放行。补上界后 4 张里 3 张归位；余下两张是**近平票**(tier1/tier2 内点数差
+≤1)但圆心偏出 300px，靠"节圆与外圆同心"的物理先验取舍修掉(详见 `locate_part_fast`)。
+全量 598 张账面：正面OK 过杀 **5/423 -> 0/423**、逃逸恒 0。最后那张过杀**也不是定位问题**，
+是**高光量测窗口太窄**——已一并修掉，见下面第二条。
+**仍不建议抬 `PITCH_FIT_MIN_HOLES`**：实测抬到 6 只救回一半、净过杀反而上升；抬到 8/10 会把好帧
+直接弄成定位失败。
+
+另一处、也是**已于 2026-10-02 修掉**的量测缺陷：球面高光的量测区半径原先取 0.35r(有效掩膜
+0.315r)，**装不下它要量的那个高光斑**。同轴光下球面高光出现在"法线指向镜头"的那一点，于是
+系统性朝光轴(画面中心)偏，离轴越远偏得越多——全量 9847 槽实测偏移/球半径 p50=0.155、p99=0.428、
+max=0.741，方向 cos(偏移, 指向画面中心) 在良品帧上 p50=0.97，是**确定性光学位移不是球坐偏**；
+**4.4% 的槽高光斑整个落在窗外**，读成低值 -> 好件判缺粒。用户报的 `F000163_RAW` #7
+(rr=0.157 已是"球压到位"的标称值、定位全对 pitch_r=317/coh=0.98，高光却只有 104) 就是它：
+窗口一放到 0.50r 立刻读到 238，全帧最亮。量测区半径已改 0.60r，账面 正面OK 过杀 **1/423 -> 0/423**、
+真缺粒/反面的空兜地板不升反略降(81->75、79->78)，逃逸恒 0。**这是量测缺陷不是阈值取舍**，
+所以没动 `BALL_HIGHLIGHT_MIN=120`——那个闸的裕度一分没让。详见参数区。
 """
 from __future__ import annotations
 
@@ -119,16 +138,37 @@ PHASE_MIN_POCKETS = 3  # 锁整圈相位至少要几个已定出的兜孔；少�
 #   ⇒ **全量 598 张实测对比**(同一批图，只换判据)：
 #        旧 `孔级 rr>=0.144 且 hl>=120`   → 正面OK 过杀 63/423 (14.9%)、逃逸 0/0/0
 #        新 `孔级 hl + 件级 rr_med`       → 正面OK 过杀  5/423 ( 1.2%)、逃逸 0/0/0
+#        新判据 + 定位补上界/近平票取舍   → 正面OK 过杀  1/423 ( 0.24%)、逃逸 0/0/0
+#        再 + 高光量测区 0.35r -> 0.60r   → 正面OK 过杀  0/423 ( 0.00%)、逃逸 0/0/0
 #     过杀降 12 倍而安全不变。旧孔级 rr 闸对"挡逃逸"的唯一贡献是那 27 张反面，而这 27 张
 #     正是件级中位数抓的(且那 27 张在旧判据下也是靠 rr 判空的，两条路殊途同归)。
+#     最后那张过杀也不是定位问题，是**高光量测窗口太窄**(见模块头与下方量测口径)。
 #     ⚠ 这是 598 张的 in-sample 结果，且反面只有 44 张 —— 上线前必须再复跑零逃逸自检。
-BALL_HIGHLIGHT_MIN = 120.0    # 孔级闸：球面高光下限(良品 p1=202，空兜 max=81)
+BALL_HIGHLIGHT_MIN = 120.0    # 孔级闸：球面高光下限(良品 p1=231，有工件帧的空兜 max=78)
 PART_R_RATIO_MED_MIN = 0.145  # 件级闸：整圈半径比中位数下限(间隙 [0.1422, 0.1520]，靠 NG 一侧)
 REFINE_R_SEED_RATIO = 0.157   # 精定位的初始半径(取"球压到位"的标称值，两侧都能收敛过去)
 
-# ---- 球面高光的量测口径：兜孔中心 0.35r 内的 (99分位 − 中位数)。
+# ---- 球面高光的量测口径：兜孔内 (99分位 − 中位数)。
 #      基线用中位数：局部油污、整片台面亮度漂移都只影响中位数以外的少数像素，分位数差因此稳。
-HIGHLIGHT_R_RATIO = 0.35  # 高光量测区半径系数(以精定位半径 r 为单位)
+#
+#      **量测区半径 0.35r -> 0.60r (2026-10-02)**：原先那个窗口**装不下它要量的东西**。
+#      同轴光下球面高光出现在"法线指向镜头"的那一点，于是它**系统性地朝光轴(画面中心)偏**，
+#      偏离槽心的距离随离轴角增大。全量 9847 槽实测：偏移/球半径 p50=0.155、p90=0.257、
+#      p99=0.428、max=0.741；而偏移方向与"槽心指向画面中心"的 cos 在良品帧上 p50=0.97、
+#      91% 的槽 >0.7 —— 是**确定性光学位移，不是球坐偏**。旧掩膜半径只有 0.35*0.9=0.315r，
+#      于是 **4.4% 的槽高光斑整个落在窗外**，读出来是个低值 -> 好件被误判缺粒。
+#      (2026-10-02 用户报的那张 F000163 #7：rr=0.157 已是"球压到位"的标称值、定位全对
+#       pitch_r=317/coh=0.98，高光却只有 104；窗口一放到 0.50r 立刻读到 238，全帧最亮。)
+#
+#      放大到 0.60r 之后：真缺粒(正面/NG 的 507 个空槽)高光上限 **81 -> 75**、反面(184 个)
+#      **79 -> 78** —— 有工件的帧里空兜内部本来就是暗的、周边也没有镜面亮点，放宽窗口不但
+#      不侵蚀余量，反而因为窗口够大、p99 不再被单颗噪点/油污顶起来，地板还略降。
+#      窗口再往大推到 1.15r(掩膜越过孔壁)时才有槽开始掉出闸(正面/OK 反而新增 1 个判空槽)
+#      —— 所以停在"整兜以内"，留 40% 余量到孔壁。
+#      副作用只在**无件**帧(空工位)：那里没有兜孔，18 个槽铺在夹具的亮斑上，放大窗口会让
+#      读数变高(103 -> 228)。但那些帧每张仍剩 13+ 个空槽、且 rr_med 多在件级闸以下，
+#      全量 87 张仍全部判 NG —— 全量 598 张 逃逸 0 / 正面OK 过杀 1/423 -> 0/423。
+HIGHLIGHT_R_RATIO = 0.67  # 高光量测区半径系数(以精定位半径 r 为单位)；有效掩膜 = 0.9*0.67 = 0.60r
 HIGHLIGHT_PCT = 99  # 高光取 99 分位：只认"少数极亮像素"，抗油污/杂散反光
 MAX_EMPTY_POCKETS = 0  # 允许的空兜数(h 级)；0 = 18 个兜孔必须个个见球面高光
 
@@ -226,8 +266,13 @@ def _outer_seed_downscaled(work: np.ndarray, scale: int = LOCATE_SEED_DOWNSCALE
 def locate_part_fast(work: np.ndarray, cand: np.ndarray,
                      refined: Optional[List[Tuple[float, float, float, float]]] = None
                      ) -> Tuple[Optional[Tuple[float, float, float]], str]:
-    """定位工件，返回 ((cx,cy,pitch_r), 方法名)。与 inspector_pure.locate_part 同构，差别只在
-    tier2 的外圆搜索降到 1/4 分辨率且只当 seed(理由与实测见 LOCATE_SEED_DOWNSCALE 注释)。
+    """定位工件，返回 ((cx,cy,pitch_r), 方法名)。与 inspector_pure.locate_part 同构，差别有三：
+      1) tier2 的外圆搜索降到 1/4 分辨率且只当 seed(理由与实测见 LOCATE_SEED_DOWNSCALE 注释)；
+      2) **两级都带上候选半径上界** r_ceil(第一站两处也带；这里曾漏掉, 是"定位歪"的头号根因, 见
+         下面 r_ceil 处的长注释)；
+      3) **两级都跑，近平票时按"与外圆同心"的物理先验取舍**(第一站是 tier1 不成就换 tier2)。
+         本站的孔心点集比第一站脏得多(伪孔心多), tier1 的票数经常与真节圆持平, 单看票数没有
+         分辨力; 见下面取舍分支的注释与全量 598 的对照实测。
 
     **方法名沿用第一站的 "pitch_fit(n=...)"**：节圆闸 HOLE_PITCH_GATE_METHODS 是按这个字符串
     白名单匹配的，改名等于把所有帧判成"节圆不可信"。
@@ -241,25 +286,57 @@ def locate_part_fast(work: np.ndarray, cand: np.ndarray,
     if ring_pts is None:
         return None, "none"
     r_floor = 1.5 * r_med_ring  # 节圆必须明显大于孔半径，否则"拟出来的圆"就是某个孔本身
+    # 候选半径上界(与第一站 locate_part 同一道闸, 两处都传: 主拟合 + 锚定拟合的共识重拟合)。
+    # **没有它 Tier1 会稳定地被假大圆骗走**: 内点容差是相对半径的(tol = max(0.06*r, 8px)), 三个近乎
+    # 共线的孔心外接出上万 px 的圆(实测本站 62950px), 容差跟着涨到 3777px(比整张图还大) -> 一帧里
+    # 每个孔都"贴"在它上面, 靠票数在 argmax 里压过真节圆; 随后共识重拟合把半径拉回中等值、容差收紧,
+    # 共识瞬间塌到 4~5 个 -> 返回一个支撑不足的假圆。而 PITCH_FIT_MIN_HOLES(=3) 恰是三点抽样的最小
+    # 样本数, 任何三点圆都天然满足, 于是 tier1 一路放行、能给出正确 10 内点的 tier2 根本没机会跑。
+    # 实测 4 张良品被这条正反馈判死(tier1 最终返回的圆心偏到 (770.6,361.9) / (604.3,413.2)、半径
+    # 359 / 270, 而真值都是 圆心≈(650,402)、半径≈316)。
+    # 上界 = 11 × 中位孔半径(本站 节圆316px/孔半径49px ≈ 6.4, 留 ~70% 余量)。回退: 传 None。
+    r_ceil = ip.PITCH_FIT_MAX_R_RATIO * r_med_ring
 
-    # tier1：三点 RANSAC 直接拟节圆(与第一站逐字一致)
+    # tier1：三点 RANSAC 直接拟节圆(与第一站一致, 必须带上同一个 r_ceil)
     fit = fit_circle_ransac(ring_pts, ip.PITCH_FIT_ITERS, ip.PITCH_FIT_TOL_RATIO,
                             ip.PITCH_FIT_TOL_MIN_PX, ip.PITCH_FIT_MIN_HOLES,
-                            r_floor, ip.PITCH_FIT_RANSAC_MAX_COMBOS)
-    if fit is not None and fit[2] > r_floor and fit[3] >= ip.PITCH_FIT_MIN_HOLES:
-        return (fit[0], fit[1], fit[2]), "pitch_fit(n=%d)" % fit[3]
+                            r_floor, ip.PITCH_FIT_RANSAC_MAX_COMBOS, r_ceil=r_ceil)
+    ok1 = fit is not None and fit[2] > r_floor and fit[3] >= ip.PITCH_FIT_MIN_HOLES
 
     # tier2：拿外圆中心当 seed(孔阵与工件外圆同心)，把 3 点 RANSAC 降成半径投票 + 干净子集重拟合
     seed = _outer_seed_downscaled(work)
-    if seed is None:
+    anch = None
+    if seed is not None:
+        anch = fit_pitch_anchored(ring_pts, seed[0], seed[1], r_floor,
+                                  ip.PITCH_FIT_TOL_RATIO, ip.PITCH_FIT_TOL_MIN_PX,
+                                  ip.PITCH_FIT_MIN_HOLES, ip.PITCH_FIT_ITERS,
+                                  ip.PITCH_FIT_RANSAC_MAX_COMBOS, r_ceil=r_ceil)
+    ok2 = anch is not None and anch[2] > r_floor and anch[3] >= ip.PITCH_FIT_MIN_HOLES
+
+    if not ok1 and not ok2:
         return None, "none"
-    anch = fit_pitch_anchored(ring_pts, seed[0], seed[1], r_floor,
-                              ip.PITCH_FIT_TOL_RATIO, ip.PITCH_FIT_TOL_MIN_PX,
-                              ip.PITCH_FIT_MIN_HOLES, ip.PITCH_FIT_ITERS,
-                              ip.PITCH_FIT_RANSAC_MAX_COMBOS)
-    if anch is not None and anch[2] > r_floor and anch[3] >= ip.PITCH_FIT_MIN_HOLES:
+    if ok2 and not ok1:
         return (anch[0], anch[1], anch[2]), "pitch_fit(n=%d)" % anch[3]
-    return None, "none"
+    if ok1 and not ok2:
+        return (fit[0], fit[1], fit[2]), "pitch_fit(n=%d)" % fit[3]
+
+    # 两个都拟出来了：**内点数差 ≤1 视为平手**，这时按"节圆与外圆同心"的物理先验取圆心离 seed
+    # 近的那个；差 ≥2 则尊重票数，不拿同心先验去压一个明显支撑更好的圆。
+    # 为什么需要这一手：点集被污染时 tier1 会挑到"几个伪孔心凑成的小圆"——它的票数与真节圆一样
+    # 低(实测 4 vs 4、5 vs 4)，argmax 靠组合枚举顺序决出胜负，圆心能偏到 300px 外(000138_origin
+    # 的 (327,445) vs 真值 (652,402))。票数在这种近平票下没有分辨力，圆心位置才有。
+    # 为什么不能直接让 tier2 优先(实测): 全量 598 反而从 3 张过杀涨到 5 张——tier2 的 seed 是
+    # 1/4 降采样 Hough，外圆被视场切边时会偏，那些帧上 tier1 才是对的。所以只在平手时才交给它。
+    if fit[3] >= anch[3] + 2:
+        best = fit
+    elif anch[3] >= fit[3] + 2:
+        best = anch
+    elif (np.hypot(fit[0] - seed[0], fit[1] - seed[1])
+          <= np.hypot(anch[0] - seed[0], anch[1] - seed[1])):
+        best = fit
+    else:
+        best = anch
+    return (best[0], best[1], best[2]), "pitch_fit(n=%d)" % best[3]
 
 
 # ============================  判据  ============================
@@ -527,7 +604,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log.info("[MISSING] 第二站=兜孔缺粒 | 日志=%s | 结果图 OK=%s / NG=%s | 判定经主程序开闸 D9(放 NG 件落盒)",
              RUNTIME_LOG_DIR, OK_SAVE_DIR, NG_SAVE_DIR)
     log.info("[MISSING] 二期判据已用 598 张全量样本复跑标定(正面OK 423/正面NG 44/反面NG 44/无件 87；"
-             "过杀 5/423、逃逸 0)：孔级 球面高光>=%.0f(18 个兜孔逐个) ＋ 件级 整圈半径比中位数>=%.3f。"
+             "过杀 0/423、逃逸 0)：孔级 球面高光>=%.0f(18 个兜孔逐个) ＋ 件级 整圈半径比中位数>=%.3f。"
              "样本量仍不算大(尤其反面 44 张)，上线前须再复跑零逃逸自检。",
              BALL_HIGHLIGHT_MIN, PART_R_RATIO_MED_MIN)
 
@@ -807,7 +884,8 @@ def _log_summary(log, counts: Dict[str, int], ratios: List[float], highlights: L
     if highlights:
         q = np.percentile(np.asarray(highlights, dtype=np.float64), [0, 1, 25, 50, 75, 99, 100])
         log.info("[SUMMARY-SLOT] 兜孔 %d 个 球面高光(99分位−中位数) min/p1/p25/p50/p75/p99/max = "
-                 "%s；**这是孔级判据**(下限 %.0f)：空兜 max=81、良品 p1=202，中间是空的。",
+                 "%s；**这是孔级判据**(下限 %.0f)：有工件的帧上 空兜 max=78、良品 p1=231，中间是空的"
+                 "(空工位『无件』帧上 18 个槽铺在夹具亮斑上，读数不具此含义，那些帧由件级闸兜)。",
                  len(highlights), " / ".join("%.0f" % v for v in q), BALL_HIGHLIGHT_MIN)
     if counts["no_actuator"]:
         log.error("[SUMMARY] ⚠ %d 个 NG 无执行器可开闸，实际未分选", counts["no_actuator"])
