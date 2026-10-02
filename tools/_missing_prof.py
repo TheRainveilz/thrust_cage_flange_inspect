@@ -59,7 +59,10 @@ def wrap_refine():
 
 
 wrap(im, "preprocess", "preprocess")
-wrap(im, "detect_hole_candidates", "找孔候选")
+# ⚠ 包的必须是 inspect_missing 真正调的那个名字。2026-10-02 起它改调 detect_hole_candidates_fast
+#   (见该函数注释)，这里若还包旧的 detect_hole_candidates 就一次都拦不到 —— "找孔候选"那行会变成
+#   空数组、中位/均值为 NaN，且这部分耗时被错算进"其余(高光/判定)"。换名字时同步改这里。
+wrap(im, "detect_hole_candidates_fast", "找孔候选")
 wrap(im, "locate_part_fast", "定位")
 wrap_refine()
 
