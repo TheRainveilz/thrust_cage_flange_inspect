@@ -132,6 +132,18 @@ def setup_supervisor_logging() -> logging.Logger:
     return log
 
 
+def _set_console_level(log: logging.Logger, level: int) -> None:
+    """只调控制台 StreamHandler 的门槛；**文件 handler 不动**，data/supervisor 的日志始终完整。
+
+    注意 TimedRotatingFileHandler 是 FileHandler 的子类、FileHandler 又是 StreamHandler 的
+    子类，所以必须显式把 FileHandler 排除掉，否则会把文件 handler 一起抬没了 —— 那就等于
+    "全静默"真的什么都不记了。
+    """
+    for h in log.handlers:
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            h.setLevel(level)
+
+
 class Station:
     """一个检测子进程的运行时状态。"""
 
@@ -154,13 +166,24 @@ class Supervisor:
 
     def __init__(self, stations: List[Station], passthrough: List[str],
                  dry_uno: bool = False, status_interval: float = STATUS_INTERVAL_S,
-                 exit_when_done: bool = False) -> None:
+                 exit_when_done: bool = False, quiet: bool = False,
+                 silent: bool = False) -> None:
         self.stations = stations
         self.passthrough = list(passthrough)
         self.dry_uno = dry_uno
         self.status_interval = status_interval
         self.exit_when_done = exit_when_done
+        self.quiet = quiet
+        self.silent = silent
         self.log = setup_supervisor_logging()
+        # 控制台降噪分两档(文件 handler 永远不动，data/supervisor 的日志始终完整)：
+        #   --quiet  : 控制台留 INFO(启动/健康/告警可见)，只把"每件 NG 的代触发行"降到 DEBUG
+        #              →见 on_ng；NG 是多数件，每件一行会把控制台淹掉。
+        #   --silent : 控制台彻底闭嘴(抬到 CRITICAL 之上)，所有监督输出只进 data/supervisor 日志
+        #              文件 —— 无显示器的产线机(经笔记本 ssh 事后翻日志)用。
+        # verify_l2 不传这两个开关 → 走默认 INFO → 代触发行照旧上 stdout，check_actuation 不受影响。
+        if silent:
+            _set_console_level(self.log, logging.CRITICAL + 1)
         self._by_id = {s.id: s for s in stations}
         self._stop = threading.Event()
         self._uno: Optional[uno_relay.UnoRelayController] = None
@@ -270,10 +293,14 @@ class Supervisor:
             self._stop.set()  # UNO 是两站共用的：触发不了就两站一起停，见模块文档
             return
         st.ng_relayed += 1
-        # 执行留痕：uno_relay 自己只用 print() 报引脚(那走 stdout、不进日志文件)，
-        # 而"到底触发了哪一路、触发了几次"是事后唯一能对账的证据，必须进监督日志。
-        self.log.info("[PIPE] 站 %s NG -> 触发 D%d (本站累计代触发 %d 次)",
-                      st.id, st.cfg["pin"], st.ng_relayed)
+        # 执行留痕：到底触发了哪一路、累计几次, 是事后唯一能对账的证据, 必须进监督日志(文件)。
+        # --quiet/--silent 下降到 DEBUG：文件 handler(DEBUG)照收, 但控制台(INFO)不刷屏 ——
+        # NG 是多数件(~60%), 每件一行会把控制台淹掉。默认(dev / verify_l2 的 --dry-uno 跑法)仍
+        # 走 INFO → 这行照旧上 stdout, 所以 verify_l2 的 check_actuation 从捕获的 stdout 逐字
+        # 解析这行不受影响(它不传 --quiet/--silent)。改这行的措辞须同步改 verify_l2。
+        emit = self.log.debug if (self.quiet or self.silent) else self.log.info
+        emit("[PIPE] 站 %s NG -> 触发 D%d (本站累计代触发 %d 次)",
+             st.id, st.cfg["pin"], st.ng_relayed)
 
     def _on_link_lost(self, station_id: str) -> None:
         """某站上报链路断开(子进程会自己停线；这里的重启交给巡检循环)。"""
@@ -501,6 +528,12 @@ def parse_args(argv: Optional[List[str]] = None):
                     help="定期打印监督摘要的秒数(0=关，默认 %(default)s)")
     ap.add_argument("--exit-when-done", action="store_true",
                     help="所有站都 rc=0 正常收工时主程序即退出(离线跑样本用)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="控制台降噪：每件 NG 的代触发行只进监督日志文件、不刷控制台"
+                         "(启动/健康/告警仍在控制台)")
+    ap.add_argument("--silent", action="store_true",
+                    help="控制台全静默：所有监督输出只进日志文件(data/supervisor/supervisor.log)，"
+                         "控制台不打任何东西。无显示器的产线机用；隐含 --quiet。")
     args, passthrough = ap.parse_known_args(argv)
     return args, passthrough
 
@@ -532,7 +565,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     sup = Supervisor([Station(c) for c in picked], passthrough, dry_uno=args.dry_uno,
                      status_interval=args.status_interval,
-                     exit_when_done=args.exit_when_done)
+                     exit_when_done=args.exit_when_done,
+                     quiet=(args.quiet or args.silent), silent=args.silent)
     rc = sup.start()
     if rc != 0:
         sup.stop()
