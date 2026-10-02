@@ -100,7 +100,7 @@ python tools/uno_manual_console.py             # 手动逐路发 D8/D9，现场�
 | 数据集 | 张数 | 布局 |
 |---|---|---|
 | `datasets/flange` | 975 jpg | `OK` / `NG` |
-| `datasets/缺粒样本` | 40 png | `正面/{OK,NG}`、`反面/{NG,正常手动反面样本}` |
+| `datasets/缺粒样本` | 40 png | `正面/{OK,NG}`、`反面/{NG,手动反面样本}` |
 
 `.gitattributes` 里 `datasets/**/*.{jpg,jpeg,png}` 全走 LFS，新增图片自动纳管。
 
