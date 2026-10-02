@@ -40,6 +40,12 @@
 | `dbg_report.py` | **主力外挂**：CSV（一行一拐角、36 列）+ 固定版式拼图 + `--sweep`（圆度×压痕数网格）+ `--sweep-radius`（半径上界扫描）+ 零逃逸约束下的推荐阈值。完整说明见 **`docs/dbg_report.md`** | `python dbg_report.py --dir <样本> --holes 0 --sweep`（cv2！用系统 Python） |
 | `analyze_feature_ab.py` | 批量统计特征 A / B 通过率写 CSV，带一堆阈值覆盖开关（`--feature-a-mode`/`--collar-gate`/`--min-marks`/`--no-pitch-gate`/…），自动写 `artifacts/reports/` | `python tools/analyze_feature_ab.py --dir <样本> --holes 0` |
 
+**耗时画像**：
+
+| 脚本 | 干嘛 | 怎么跑 |
+|---|---|---|
+| `_pure_prof.py` | **第一站整帧耗时**（inspect 总耗时 + 各阶段占比），产物 `_timing_pure.txt`。**给产线机 CPU 选型出第一站的数字**，与 `_missing_prof.py` 口径一致（都只量算法、不含 imdecode） | `python tools/_pure_prof.py`（cv2！；样本目录/限量改文件顶部常量） |
+
 **一次性诊断脚本 `_diag_*`**（无 argparse，**改文件顶部常量**来调，读完即用完的探针，别当稳定接口）：
 
 | 脚本 | 回答的问题 |
