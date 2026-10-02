@@ -72,7 +72,7 @@ import numpy as np
 
 import inspector_pure as ip
 from inspector_pure import (AcquisitionError, RUNTIME_LOGGER, crop_pad,
-                            detect_hole_candidates, fit_circle_ransac, fit_pitch_anchored,
+                            fit_circle_ransac, fit_pitch_anchored,
                             hole_on_pitch, imwrite_unicode, preprocess, refine_hole,
                             setup_console, setup_runtime_logging, unique_image_name)
 
@@ -373,6 +373,141 @@ def locate_part_fast(work: np.ndarray, cand: np.ndarray,
 
 
 # ============================  判据  ============================
+# ============================  找孔候选（加速版）  ============================
+# 本站不再直接调 inspector_pure.detect_hole_candidates：它有两个**白烧**，见下面函数的注释。
+#
+# ⚠ **两个开关的默认值都是"关"= 与原版逐位等价**，加速只来自 L1/L3(见下面 _F32View)。
+#   原因见函数注释末尾"为什么默认关" —— 这两个开关都是**真改机制**(候选集系统性变)，
+#   而本项目对这类改动的既定原则是"全量 sweep 只证样本、不证产线"(2026-10-01 第一站同款改动
+#   已按此否决)。两个开关都**已实测、结论都在注释里**，要开就改下面一行，不用重做实验。
+CAND_DOWNSCALE = 1            # 降采样倍数(1=关)。试过 2 -> **验不过**(1 张正面OK 被过杀)
+CAND_SKIP_FIRST_PASS = False  # 跳过"更严的累加器阈值"那一遍。**过了验收线**，但见下面权衡
+
+
+def detect_hole_candidates_fast(work: np.ndarray) -> np.ndarray:
+    """`inspector_pure.detect_hole_candidates` 的加速版：返回同一套 (x,y,r) 粗候选，只是更快。
+
+    原版有两处白烧(全量 598 张实测)，都做成了开关，但**默认都关**。
+
+    ## 白烧①：白跑的那一遍阈值 —— 实现了，实测**过了验收线**，但默认关
+
+    原版先跑 `p2=HOLE_HOUGH_P2`(严, 55)，候选不足 `MIN_HOLE_COUNT` 再跑
+    `p2=HOLE_HOUGH_P2_FALLBACK`(松, 32)。实测 **84.2% 的帧第一遍一个圆都找不到**
+    (正面/OK 均值 0.2 个、反面 0.5 个、无件 0.0 个) —— 那一遍 ~9.2ms 纯浪费。
+
+    **全量证据(598 帧，只跳这一遍)**：
+      · 判定 **598/598 逐帧完全相同**；
+      · **逃逸 0，正面OK 过杀 0/423**(与改动前一致) —— 你定的验收线全过；
+      · 逐槽读数有 **659 条微动**(最大 |Δ半径比| 0.021、|Δ高光| 4)：约 16% 的帧上严阈值本来能
+        凑够 4 个候选、原版会用那个更小的集合，跳过后改用松阈值的集合。判定没跟着动；
+      · 中位 49.67ms -> **40.20ms**。
+
+    **为什么最后还是默认关**：这条**不是**逐位等价(读数确实变了)，它是"真改机制" —— 换了个
+    更松的检测器，候选集系统性变化。本项目对这类改动的既定原则是**"全量 sweep 只证样本、
+    不证产线"**(来料是振动盘随机姿态 + NG 多数 + 拒件回流重拍，分布 ≠ 数据集；回流还放大
+    每趟的逃逸抽奖)，2026-10-01 第一站 `detect_hole_candidates` 上**同款改动已按此否决**。
+    而省下的 9.6ms 在 200ms 预算里没有实际意义(本站改前中位 72.7ms，本来就有余量) ——
+    **拿"先严后松"这道保守余量换 9.6ms，在零逃逸机器上不划算**。
+    要开：`CAND_SKIP_FIRST_PASS = True`，验收证据已在上(638 帧全量比对，判定零变化)。
+
+    ## 白烧②：没降采样 —— 实现了，**验不过，默认关(CAND_DOWNSCALE=1)**
+
+    HoughCircles 的累加器 `dp=1.0` 与原图同分辨率，降到 1/2 幅面 Hough 本身能快 ~3 倍
+    (微基准 1280×800 **11.60ms** -> 640×400 **3.89ms**)，而且半径/间距参数本来就是按图宽归一化的
+    比例量(`HOLE_R_MIN_RATIO` 等)，语义不随缩放变。**但它过不了验收线**：
+
+      598 帧全量比对，`正面/OK/20261001_160755_819_CAM_F000064_RAW.png` 被过杀(OK -> NG_EMPTY_POCKET)。
+      根因：降采样让节圆拟合从 7 个内点变成 13 个，中心挪 1.7px、节圆半径挪 2.2px、相位挪 0.37°，
+      于是第 8 槽的**种子位置**偏了一点 —— 而那一槽原版的半径比 0.1103 本来就是 18 槽里最低的
+      (临界)，种子一动 `refine_hole` 就抓到了旁边一条小边(半径比塌到 0.0486、高光 36)，被记成
+      "空兜" -> 整帧 NG。**这不是降采样算错了，是整条量测链对种子位置本来就敏感**：
+      一张 OK 件的第 8 槽离临界只差 2px 的定位扰动，这个脆弱面本身值得记住。
+      代价 3.7ms/帧，换成"零过杀"，值。
+
+    ## 两个开关都关时 = 原版的逐位等价(自证)
+    `CAND_DOWNSCALE=1 + CAND_SKIP_FIRST_PASS=False` 时本函数与原版**逐位相同**：598 帧判定与
+    逐槽读数(半径比/高光)**最大差值恰为 0**。这是"加速版没改写算法"的自证，改任何一处都要重跑。
+
+    ⚠ **改动这里(或改 inspector_pure 的 refine_hole/locate_part)必须重跑 `tools/_missing_equiv.py`
+    全量比对**(`before` 快照 + 新快照 + `cmp`)，要求三条同时成立：判定逐帧不劣化、
+    **逃逸恒为 0**、正面OK 过杀不增加。
+    """
+    s = max(1, int(CAND_DOWNSCALE))
+    img = work if s == 1 else cv2.resize(work, None, fx=1.0 / s, fy=1.0 / s,
+                                         interpolation=cv2.INTER_AREA)
+    w = img.shape[1]
+    r_lo = max(3, int(ip.HOLE_R_MIN_RATIO * w))
+    r_hi = max(r_lo + 2, int(ip.HOLE_R_MAX_RATIO * w))
+    min_dist = max(8, int(ip.HOLE_MIN_DIST_RATIO * w))
+    thresholds = [] if CAND_SKIP_FIRST_PASS else [ip.HOLE_HOUGH_P2]
+    if ip.HOLE_HOUGH_P2_FALLBACK > 0 and ip.HOLE_HOUGH_P2_FALLBACK < ip.HOLE_HOUGH_P2:
+        thresholds.append(ip.HOLE_HOUGH_P2_FALLBACK)
+    cand = np.zeros((0, 3), np.float64)
+    for p2 in thresholds:
+        circles = cv2.HoughCircles(img, cv2.HOUGH_GRADIENT, dp=ip.HOLE_HOUGH_DP, minDist=min_dist,
+                                   param1=ip.HOLE_HOUGH_P1, param2=p2,
+                                   minRadius=r_lo, maxRadius=r_hi)
+        if circles is not None:
+            cand = np.asarray(circles[0], dtype=np.float64)
+        if len(cand) >= ip.MIN_HOLE_COUNT:
+            break
+    if len(cand) > ip.MAX_HOLE_CANDIDATES:  # 半径由大到小截断, 防异常图卡死
+        cand = cand[np.argsort(-cand[:, 2])][:ip.MAX_HOLE_CANDIDATES]
+    if s > 1 and len(cand):
+        cand[:, :3] *= float(s)  # 中心与半径都还原到原图尺度
+    return cand
+
+
+# ============================  量测加速：免掉重复的整幅转换  ============================
+class _F32View:
+    """把**已经算好**的 float32 整幅图喂给 `inspector_pure.refine_hole`，替掉它内部那句
+    `gray_f = gray.astype(np.float32)`。
+
+    **为什么要这个替身**：那句 astype 每次都把 **1280×800 整幅**重转一遍(float32 要新分配 4MB)。
+    而 `refine_hole` 一帧要被调 **30~36 次**(候选精修 ~18 次 + 逐槽精修 18 次)，
+    同一张图因此被转了 30 多遍 —— 微基准单次 astype **0.85ms**，全量实测(598 帧)整帧中位
+    **72.72ms -> 49.67ms**。
+    「那就传 float32 进去」躲不掉：`astype(float32)` 作用在 float32 上仍然整幅拷贝(微基准 0.65ms/次)。
+
+    所以这里给 refine_hole 一个**鸭子类型替身**。它只用到两样东西 ——
+    `.astype(np.float32)` 与 `.shape[:2]` —— 替身把 astype 直接返回缓存的**同一块**数组(零拷贝)、
+    shape 透传。**数值逐位相同**(不是近似：`cv2.remap` 拿到的就是原来那个 float32 数组)。
+
+    ⚠ **这是刻意的接口假设，不是通用 ndarray 替身**：若 `inspector_pure.refine_hole` 改用别的
+    ndarray 接口(下标、ufunc、切片…)这里会**立刻 AttributeError 炸出来**，不会静默算错。
+    动过 inspector_pure 的 refine_hole 之后，必须重跑 `tools/_missing_equiv.py` 全量比对。
+    """
+    __slots__ = ("_a",)
+
+    def __init__(self, arr: np.ndarray) -> None:
+        self._a = arr
+
+    def astype(self, dtype: "np.dtype | type", **kw) -> np.ndarray:
+        return self._a
+
+    @property
+    def shape(self):
+        return self._a.shape
+
+
+# 圆盘掩膜缓存：掩膜只由 (h, w, half) 决定，而一帧 18 槽里 half 只有 6~8 种取值。
+# 原先每槽都重新 mgrid+hypot 建一遍(0.032ms × 18 = 0.6ms/帧)，纯重复。
+_MASK_CACHE: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+
+def _disk_mask(h: int, w: int, half: int) -> np.ndarray:
+    """半径为 0.9*half 的圆盘布尔掩膜(h×w)。表达式与原实现逐字相同 ⇒ 逐位相同。"""
+    key = (h, w, half)
+    m = _MASK_CACHE.get(key)
+    if m is None:
+        yy, xx = np.mgrid[0:h, 0:w]
+        m = np.hypot(xx - (w - 1) / 2.0, yy - (h - 1) / 2.0) <= half * 0.9
+        if len(_MASK_CACHE) > 256:  # 兜底：正常远小于此，异常输入也不让它无限涨
+            _MASK_CACHE.clear()
+        _MASK_CACHE[key] = m
+    return m
+
+
 def _measure_slot(work: np.ndarray, gray_f: np.ndarray, px: float, py: float,
                   pitch_r: float, cos_t: np.ndarray, sin_t: np.ndarray
                   ) -> Optional[Tuple[float, float, float, float, float, bool]]:
@@ -388,6 +523,8 @@ def _measure_slot(work: np.ndarray, gray_f: np.ndarray, px: float, py: float,
 
     收敛圆心(hx,hy)也一并返回：判定只用到 r/高光，但 --debug 的叠加图要画**实际定到哪**，
     而不是只知道"从哪出发" —— 两者差得远就说明精定位被旁边的棱/孔壁拽走了。
+
+    `work` 传的是 `_F32View`(见该类注释)，不是原图 —— 只为省掉 refine_hole 里重复的整幅转换。
     """
     got = refine_hole(work, float(px), float(py), float(REFINE_R_SEED_RATIO * pitch_r),
                       cos_t, sin_t)
@@ -401,8 +538,7 @@ def _measure_slot(work: np.ndarray, gray_f: np.ndarray, px: float, py: float,
     if out_of_frame or patch.size == 0:
         return None
     h, w = patch.shape[:2]
-    yy, xx = np.mgrid[0:h, 0:w]
-    m = np.hypot(xx - (w - 1) / 2.0, yy - (h - 1) / 2.0) <= half * 0.9
+    m = _disk_mask(h, w, half)
     if int(m.sum()) < 4:
         return None
     # 基线用中位数：局部油污、整片台面亮度漂移都只影响中位数以外的少数像素，分位数差因此稳
@@ -423,7 +559,10 @@ def inspect_missing(bgr: np.ndarray, name: str = "") -> MissingResult:
         return res
 
     bgr, gray, work, _clahe, _scale = preprocess(bgr)
-    cand = detect_hole_candidates(work)
+    # 整幅转 float32 **一次**，之后所有 refine_hole 调用都用这个替身(见 _F32View)。
+    # 原先 refine_hole 内部每调一次就转一遍整幅图，一帧 30+ 次 = ~29ms 白烧。
+    work_view = _F32View(work.astype(np.float32))
+    cand = detect_hole_candidates_fast(work)
     if len(cand) < POCKET_MIN_COUNT:
         res.verdict = NG_POCKET_NOT_FOUND
         res.reason = "兜孔候选不足: %d < %d" % (len(cand), POCKET_MIN_COUNT)
@@ -436,7 +575,7 @@ def inspect_missing(bgr: np.ndarray, name: str = "") -> MissingResult:
     sin_t = np.sin(ang).astype(np.float32)
     refined: List[Tuple[float, float, float, float]] = []
     for (x0, y0, r0) in cand:
-        got = refine_hole(work, float(x0), float(y0), float(r0), cos_t, sin_t)
+        got = refine_hole(work_view, float(x0), float(y0), float(r0), cos_t, sin_t)
         if got is not None:
             refined.append(got)
     if len(refined) < POCKET_MIN_COUNT:
@@ -509,7 +648,7 @@ def inspect_missing(bgr: np.ndarray, name: str = "") -> MissingResult:
             n_fail += 1  # 切边的槽判不了球，与"没看见球"同等待遇(绝不放行)
             RUNTIME_LOGGER.debug("[SLOT] %s #%d (%.1f,%.1f) 切边 -> 记为无球", name, k, px, py)
             continue
-        got = _measure_slot(work, gray_f, px, py, res.pitch_r, cos_t, sin_t)
+        got = _measure_slot(work_view, gray_f, px, py, res.pitch_r, cos_t, sin_t)
         if got is None:
             n_fail += 1
             RUNTIME_LOGGER.debug("[SLOT] %s #%d (%.1f,%.1f) 精定位/量测失败 -> 记为无球",
