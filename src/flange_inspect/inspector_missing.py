@@ -841,7 +841,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if bgr is None:
                 counts["bad"] += 1
                 log.warning("[FRAME-INVALID] %s，按 NG 处理", name)
-                log.info("[INSPECT-DONE] #%d %s  判定 NG  耗时 0.0ms  [%s]  图像读不出来(无效帧 NG)",
+                log.info("[INSPECT-DONE] #%d %s  判定 NG  耗时 0.0ms  [%s]  图像读不出来(无效帧 NG)\n",
                          seq, name, actuate(name))
                 continue
             res = inspect_missing(bgr, name)
@@ -862,15 +862,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 consecutive_timeouts = 0
 
+            # 帧间空一行分隔，与第一站 inspector_pure.py 的观感一致(那边 :3329 的 sep 与
+            # log_frame_timing 末行各补一处)，否则逐帧明细糊成一片、`--debug` 下尤其难读。
+            # **本站固定补**：第一站是按 `--timing` 二选一(不补是留给 [TIMING-INSPECT] 当末行)，
+            # 而本站 `--timing` 没有逐帧明细行，[INSPECT-DONE] 就是本帧末行，任何时候都该补。
             if is_ok:
                 counts["ok"] += 1
-                log.info("[INSPECT-DONE] #%d %s  判定 OK  耗时 %.1fms  槽 %d/%d",
+                log.info("[INSPECT-DONE] #%d %s  判定 OK  耗时 %.1fms  槽 %d/%d\n",
                          seq, name, res.elapsed_ms, len(res.pockets), N_POCKETS)
                 if args.debug and args.save_ok:
                     _save_debug_image(bgr, name, res, True)
             else:
                 counts["ng"] += 1
-                log.info("[INSPECT-DONE] #%d %s  判定 NG  耗时 %.1fms  [%s]  %s",
+                log.info("[INSPECT-DONE] #%d %s  判定 NG  耗时 %.1fms  [%s]  %s\n",
                          seq, name, res.elapsed_ms, actuate(name), reason_text)
                 if args.debug:
                     _save_debug_image(bgr, name, res, False)
