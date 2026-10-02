@@ -3,8 +3,8 @@
 **每个脚本的"怎么用 / 为什么这么写"都写在各自文件头部的 docstring 里**（那是随代码走、不会漂的地方）。
 本文件只做**分类导航**：以后要改某样东西时，先在这儿找到它属于哪一类、干嘛的，再去翻它的 docstring。
 
-分三类：**① 验证闸**（上线前必须绿的硬闸）、**② 硬件调试**（现场核对接线）、**③ 第一站阈值调优 / 诊断**
-（离线拿样本调参，产线节拍里不跑）。第二站（缺粒）目前只有验证闸，没有对应的调参外挂——要做得另写一份。
+分四类：**① 验证闸**（上线前必须绿的硬闸）、**② 硬件调试**（现场核对接线）、**③ 第一站阈值调优 / 诊断**
+（离线拿样本调参，产线节拍里不跑）、**④ 第二站（缺粒）回归 / 诊断外挂**（同上，只服务 `inspector_missing.py`）。
 
 > 解释器有坑：`_diag_*` 的 docstring 写的是 `.venv/Scripts/python.exe`，但 `dbg_report` 需要 `cv2`
 > 而仓库 `.venv` **没装 cv2**（用系统 `D:\Python\python.exe`）。跑之前先确认你挑的解释器装了 opencv/numpy。
@@ -53,7 +53,28 @@
 
 ---
 
-## ④ 文档渲染（把仓库 Markdown 转成离线可看的 HTML）
+## ④ 第二站（缺粒）—— 回归闸 / 诊断外挂
+
+只服务**第二站兜孔缺粒**（`inspector_missing.py`）。同样**产线节拍里不跑**，只离线拿样本跑。
+
+| 脚本 | 干嘛 | 怎么跑 |
+|---|---|---|
+| `_missing_equiv.py` | **回归闸：改过第二站算法必跑。** 598 帧全量快照（判定 + 每槽半径比/高光）：改前存 `before`、改后存 `<tag>`、再 `cmp`，要求**判定逐帧不劣化 + 逃逸恒为 0 + 正面OK 过杀不增加**。可临时覆盖两个候选加速开关来隔离变量 | `python tools/_missing_equiv.py before\|<tag>\|cmp before <tag>`，覆盖写法 `... <tag> <降采样> <跳首遍0/1>` |
+| `_missing_hough_probe.py` | 两个候选加速开关值不值得开：首遍严阈值 `p2=55` 的命中率、候选数分布 | `python tools/_missing_hough_probe.py` → `_hough_probe.txt` |
+| `_missing_prof.py` | 单帧耗时分解（preprocess / 找孔候选 / 定位 / refine / 逐槽），改完再量瓶颈在哪 | `python tools/_missing_prof.py` → `_timing_missing.txt` |
+| `_missing_micro.py` | 微基准：整幅 `astype` 开销 / Hough 各分辨率 / 掩膜建图 —— `_F32View` 与掩膜缓存的立论依据 | `python tools/_missing_micro.py` → `_micro_missing.txt` |
+| `_missing_back_final.py` | `反面/NG` 全 44 张按用户 2026-10-02 定性分类 + 两级闸各拦下几张 | `python tools/_missing_back_final.py` → `_back_final.txt` |
+| `_missing_sweep.py` | 全量逐帧逐槽落盘成 JSON（其余分布分析的源头） | `python tools/_missing_sweep.py` |
+
+> ⚠ 两条：
+> **①`_equiv_before.json` / `_equiv_before_t.json` 是 `cmp` 的冻结基线，别删。**它是改优化前的 598 帧快照
+> （中位 72.72ms），任何后续改动都拿它比。
+> **②`_missing_equiv.py` 的前 4 行常量目录指向产线机外的 `I:/data.zip/data/missing/Class/`**（598 帧），
+> 换机器要改。它被 `inspector_missing.py` 的 `detect_hole_candidates_fast` / `_F32View` 注释**点名要求重跑**。
+
+---
+
+## ⑤ 文档渲染（把仓库 Markdown 转成离线可看的 HTML）
 
 | 脚本 | 干嘛 | 怎么跑 |
 |---|---|---|
@@ -63,9 +84,14 @@
 
 ## 要不要给每个脚本单独写文档？——不用
 
-问过一轮：这 12 个脚本**都已经带了实打实的头部 docstring**（怎么跑、为什么这么写、跟谁耦合都在里面），
-没有空壳。再单独写 12 份 `.md` 只会**和 docstring 重复、然后各自漂**——改了代码忘了改 md，比没有还糟。
+问过一轮：这些脚本**都已经带了实打实的头部 docstring**（怎么跑、为什么这么写、跟谁耦合都在里面），
+没有空壳。再单独写一份份 `.md` 只会**和 docstring 重复、然后各自漂**——改了代码忘了改 md，比没有还糟。
 
 所以最值的做法就是**这一份索引**（你现在看的）：以后想改哪样东西，先在这儿定位到分类和文件，
 再翻它的 docstring 看细节。只有 `dbg_report.py` 因为流程复杂、要贴报告、要对照标定值，才值得
 额外一份 `docs/dbg_report.md`——其余的 docstring 足够。
+
+> ④ 里的 `_missing_*` 沿用同样的姿态：**`_` 前缀 = 一次性探针，别当稳定接口**（改文件顶部常量来调）。
+> 2026-10-02 清过一轮：二期标定那一回的一次性探针（高光窗口比定标、孔级判据重打分、定位 tier 规则、
+> 球径/广度闸、反面三类定性等 ~29 个脚本 + ~27MB 产物）已删——**它们的结论都已落在 memory / 本文档 /
+> `inspector_missing.py` 注释里**，留下的这 6 个是"以后还会再问一次"的那几个。
