@@ -21,16 +21,22 @@
 Hough 候选常年整片是伪圆，每帧都掉进 locate_part 的全幅大半径 Hough(实测 98~288ms，最坏帧
 380ms，打穿 300ms 预算)。理由、安全性与等价性实测都写在 `LOCATE_SEED_DOWNSCALE` 注释里。
 
-**二期判据(已用 `datasets/缺粒样本/` 40 张标定，零逃逸)**：一句话 ——
+**二期判据(已用 598 张全量样本复跑标定，零逃逸)**：一句话 ——
 **先用 Hough 候选把节圆与相位锁出来，再合成整圈 18 个兜孔的标称位置、逐个精定位**；
-每个兜孔要求"球盘半径 ≈ 0.157×节圆半径"(球压到位) **且** "球面高光足够强"。
+然后**分两级判**：孔级看「这个兜有没有球」，件级看「整圈球坐没坐到位」。
+两级用的量是**两个不同的维度**，绝不能在同一个槽上硬 AND(旧写法就是这么错的，见参数区注释)。
 
 为什么要合成 18 槽：一期只量 Hough 真检出来的那几个兜孔，`正面/NG` 里有 9 张只检出 4~7 个
 候选，整帧靠"候选不足"兜住 —— 那**不是算法看见了空兜，是数量闸拦下来的**。合成之后每个兜孔
 都被量到，判定不再依赖 Hough 的召回率(相位只要 3 个兜孔就能锁)。
 
-⚠ **仍待做的事**：40 张样本量很小，`BALL_R_RATIO_MIN` 的间隙是实测的(见参数区注释)，
-上线前应再攒样本复跑，且零逃逸自检每次都要过(逃逸恒为 0 才谈得上上线)。
+⚠ **仍待做的事**：`datasets/缺粒样本/` 只有 40 张，2026-10-02 换成 `I:\data.zip\data\missing\Class`
+的 598 张(正面OK 423 / 正面NG 44 / 反面NG 44 / 无件 87)复跑标定。样本量仍然不算大(尤其反面只有
+44 张)，上线前应再攒样本复跑，且零逃逸自检每次都要过(逃逸恒为 0 才谈得上上线)。
+已知未修的一处：节圆 RANSAC 偶尔锁定到**中心内孔**(实测 4/423 张正面OK，拟合半径 270/331/359/475
+而真值 ~316，相位一致性掉到 0.34~0.75，`--debug` 叠加图随之画歪)。这些帧目前被孔级高光闸判 NG，
+即过杀。正解是把相位一致性加进 tier1 的接受条件、不过就退回 tier2，但**不能直接抬
+`PITCH_FIT_MIN_HOLES`**(实测抬到 6 只救回一半、净过杀反而上升；抬到 8/10 会把好帧弄成定位失败)。
 """
 from __future__ import annotations
 
@@ -84,39 +90,53 @@ N_POCKETS = 18
 POCKET_ANGLE_STEP = 360.0 / N_POCKETS
 PHASE_MIN_POCKETS = 3  # 锁整圈相位至少要几个已定出的兜孔；少于此判 NG(看不清就不放行)
 
-# ---- 判据(二期，量值全部来自 40 张样本实测；极性方向是"有球=中心比台面**暗**")
-#      同轴光垂直照下来，三种情况收敛到三个明显不同的半径(都以节圆半径为 1)：
-#        · **球压到位的兜孔**：一块暗盘 + 一个极亮的球面高光点(凸球把同轴光反射回镜头)，
-#          球几乎填满正面孔口 → 精定位半径 **≈0.157**
-#        · **空兜**：透光亮孔(光穿过孔打到下方白底板)，露出的是更小的孔底 → **≈0.118**
-#        · **反面浮球**：没压进去(用户：反面压不进去，所以即使球在表面也 NG)。⚠ 别信"反面每颗球
-#          都过不了压到位"这句旧话 —— 实测**分两类**：手动摆的整圈反面(000035/036，18 颗球全在)
-#          确实每槽都收敛到 ≈0.13、0 绿判 NG；但真产线反面/NG(000027~000030)每张有 **5~7 个绿槽**、
-#          半径比冲到 **0.171**(全体 720 槽 max=0.213)。所以判据在**孔级并不隔离正/反**。
-#      所以"这个兜孔有没有一颗压到位的球" ⇔ 半径比够大 **且** 有球面高光。
-#      **反面靠什么被判掉，是件级不是孔级**：MAX_EMPTY_POCKETS=0，而每一张反面样本都留有 **≥11 个
-#      空槽**(实测最少 11，000030)，第一个空槽就够判 NG —— 不需要正/反分类器，但这道安全是
-#      "反面总有足够多的空槽"给的**统计余量**，不是"反面没有一个绿槽"。样本仅 14 张反面，务必复跑。
+# ---- 判据(二期)：**分两级，两级量的是两个不同的维度，不要在一个槽上硬 AND**
 #
-#      BALL_R_RATIO_MIN 取在**实测间隙**里：良品 54 个槽最低 0.152，整圈全在的手动反面(000035/036)
-#      每槽最高也只有 0.133 → 间隙 [0.133, 0.152]，取 0.144(靠 NG 一侧，按安全铁律宁可过杀)。
-#      这只是 40 张样本的间隙，样本量小，上线前必须复跑。
-BALL_R_RATIO_MIN = 0.144
-REFINE_R_SEED_RATIO = 0.157  # 精定位的初始半径(取"球压到位"的标称值，两侧都能收敛过去)
+#   【孔级】这个兜里有没有球  —— 只看**球面高光**
+#       同轴光垂直照下来，球是凸的，把光反射回镜头形成一个小亮点；空兜没有。
+#       这个量**干净隔离正面缺球**：598 张全量实测，507 个空兜的高光最高只有 81，
+#       而判 OK 的良品 6480 个槽最低 167、p1=202 —— 中间是空的，取 120 两侧各留 39 / 47 级。
+#
+#   【件级】整圈球坐没坐到位  —— 看**整圈半径比的中位数**
+#       精定位半径(以节圆半径为 1)在三种落座状态下收敛到三个不同的值：
+#         · 球压到位：暗盘 + 极亮球面高光点，球几乎填满正面孔口 → **≈0.157**
+#         · 空兜    ：透光亮孔(光穿过孔打到下方白底板)，露出的是更小的孔底 → **≈0.118**
+#         · 反面浮球：没压进去(用户：反面压不进去，所以即使球在表面也 NG)
+#       ⚠ **半径比在孔级不隔离正/反，千万别拿它当孔级硬闸**：单槽半径比对**一颗球坐得
+#         多深**极敏感，良品整圈实测 0.107~0.168，反面NG 整圈实测 0.107~0.213 —— 两组在
+#         孔级完全重叠。旧写法 `rr>=0.144 and hl>=120` 就是这么错的：实测把 **45/423 张
+#         好件判死**，坏槽高光是 204~234(球明明在，只是坐得浅一点)，半径比 0.131~0.144。
+#         用户 2026-10-01 报的 `#17 0.139/208` 就是这个类的样本。
+#       但整圈**一起**下移才是反面浮球/定位跑偏的特征，取件级中位数后两组分得很开：
+#         良品 min 0.1335 / p5 0.1539，反面 max 0.1422 → 间隙 [0.1422, 0.1520]。
+#       ⚠ **件级闸是承重的，不是"保险"**：新判据下 44 张反面里有 **27 张孔级全绿**(每个槽的
+#         高光都 ≥120)，只有件级中位数拦得住 —— 去掉它这 27 张全部逃逸。旧写法之所以看着
+#         "反面每张都留 ≥11 个空槽"，是孔级 rr 硬闸顺带把反面的槽判空了造出来的**假余量**
+#         (同一批反面，旧判据 未见球槽数 11/18/18，新判据 0/0/18)。
+#       ⚠ 件级闸裕度只有 **0.0028**(反面最高 0.1422 vs 闸 0.145)，比看起来窄 —— 反面样本
+#         翻倍复跑是上线前优先级最高的一件事。
+#
+#   ⇒ **全量 598 张实测对比**(同一批图，只换判据)：
+#        旧 `孔级 rr>=0.144 且 hl>=120`   → 正面OK 过杀 63/423 (14.9%)、逃逸 0/0/0
+#        新 `孔级 hl + 件级 rr_med`       → 正面OK 过杀  5/423 ( 1.2%)、逃逸 0/0/0
+#     过杀降 12 倍而安全不变。旧孔级 rr 闸对"挡逃逸"的唯一贡献是那 27 张反面，而这 27 张
+#     正是件级中位数抓的(且那 27 张在旧判据下也是靠 rr 判空的，两条路殊途同归)。
+#     ⚠ 这是 598 张的 in-sample 结果，且反面只有 44 张 —— 上线前必须再复跑零逃逸自检。
+BALL_HIGHLIGHT_MIN = 120.0    # 孔级闸：球面高光下限(良品 p1=202，空兜 max=81)
+PART_R_RATIO_MED_MIN = 0.145  # 件级闸：整圈半径比中位数下限(间隙 [0.1422, 0.1520]，靠 NG 一侧)
+REFINE_R_SEED_RATIO = 0.157   # 精定位的初始半径(取"球压到位"的标称值，两侧都能收敛过去)
 
-# ---- 球面高光(第二道确认)：兜孔中心 0.35r 内的 (99分位 − 中位数)。球面是凸的，把同轴光
-#      反射回镜头形成一个小亮点；空兜没有这个点。
-#      ⚠ **它是确认、不是主判据**：只用高光会漏掉 4 张反面(000031/000032/000035/000036 的
-#      高光 138~166，与良品的 194+ 之间没有安全间隙)。半径比那一道才是决定性的。
-#      良品 54 个槽的高光最低 194，取 120 留 74 个灰度级的余量。
-BALL_HIGHLIGHT_MIN = 120.0
+# ---- 球面高光的量测口径：兜孔中心 0.35r 内的 (99分位 − 中位数)。
+#      基线用中位数：局部油污、整片台面亮度漂移都只影响中位数以外的少数像素，分位数差因此稳。
 HIGHLIGHT_R_RATIO = 0.35  # 高光量测区半径系数(以精定位半径 r 为单位)
-HIGHLIGHT_PCT = 99  # 高光取 99 分位，基线取中位数：只认"少数极亮像素"，抗油污/杂散反光
-MAX_EMPTY_POCKETS = 0  # 允许的空兜数；0 = 18 个兜孔必须个个有压到位的球
+HIGHLIGHT_PCT = 99  # 高光取 99 分位：只认"少数极亮像素"，抗油污/杂散反光
+MAX_EMPTY_POCKETS = 0  # 允许的空兜数(h 级)；0 = 18 个兜孔必须个个见球面高光
 
 # ---- 判定时限 fail-safe：与第一站同一条产线的节拍预算(同源，改一处两站都生效) ----
+#      两个值都在 import 时从 inspector_pure 取，是**快照不是活引用**：唯一来源是
+#      inspector_pure.py:110/111，运行期再改 ip.* 不会追到这里来。
 RESULT_DEADLINE_MS = ip.RESULT_DEADLINE_MS
-TIMEOUT_ESCALATE_N = 15  # 连续这么多帧超时 -> 停线(AcquisitionError -> 主程序重启本站)
+TIMEOUT_ESCALATE_N = ip.TIMEOUT_ESCALATE_N  # 连续这么多帧超时 -> 停线；0=永不自动停(纯 fail-safe)
 
 # ---- 定位：与 inspector_pure.locate_part 同一条链、同一套验收标准，**只改一处** ——
 #      "找外圆当锚"那一步降到 1/4 分辨率，而且它的结果**只当 seed**。
@@ -145,9 +165,9 @@ class PocketResult:
     rx: float  # refine_hole 实际收敛到的圆心；与 (cx,cy) 的差就是定位漂移，叠加图上画成连线
     ry: float
     r: float  # 该槽精定位出的半径
-    r_ratio: float  # r / 节圆半径 —— 主判据(球压到位≈0.157，空兜≈0.118，反面≈0.13)
-    highlight: float  # 中心区 (99分位 − 中位数) —— 球面高光，第二道确认
-    has_ball: bool
+    r_ratio: float  # r / 节圆半径 —— **件级**判据(整圈取中位数：球压到位≈0.157，空兜≈0.118)
+    highlight: float  # 中心区 (99分位 − 中位数) —— 球面高光，**孔级**判据
+    has_ball: bool  # 本槽是否见球面高光(孔级，只看 highlight)
 
 
 @dataclass
@@ -249,12 +269,14 @@ def _measure_slot(work: np.ndarray, gray_f: np.ndarray, px: float, py: float,
     """量一个兜孔槽(标称位置 px,py)，返回 (收敛圆心x, 收敛圆心y, r, 半径比, 高光, has_ball)；
     量不出来返回 None。
 
-    从标称位置出发精定位 —— 这一步同时兼顾"球盘边缘"与"孔壁边缘"两种可能，**收敛到哪一边本身
-    就是判据**：球压到位时收敛到 ≈0.157×节圆半径，空兜/未压入收敛到 ≈0.12~0.13。
+    从标称位置出发精定位 —— 这一步同时兼顾"球盘边缘"与"孔壁边缘"两种可能，**收敛到哪一边
+    本身带信息**：球压到位时收敛到 ≈0.157×节圆半径，空兜/未压入收敛到 ≈0.12~0.13。
+    但**收敛到哪一边不作为本槽的判据**：单槽半径比对"一颗球坐得多深"太敏感，良品/反面在孔级
+    完全重叠(见参数区注释)。半径比一律带回去给**件级**中位数用，本槽的 has_ball 只看高光。
     量不出来(切边等)一律返回 None，由调用方按"没看见球"记 —— 绝不能拿边缘复制出来的像素
     冒充"有高光"，那是拿假数据换放行。
 
-    收敛圆心(hx,hy)也一并返回：判定只用到 r/半径比/高光，但 --debug 的叠加图要画**实际定到哪**，
+    收敛圆心(hx,hy)也一并返回：判定只用到 r/高光，但 --debug 的叠加图要画**实际定到哪**，
     而不是只知道"从哪出发" —— 两者差得远就说明精定位被旁边的棱/孔壁拽走了。
     """
     got = refine_hole(work, float(px), float(py), float(REFINE_R_SEED_RATIO * pitch_r),
@@ -275,7 +297,9 @@ def _measure_slot(work: np.ndarray, gray_f: np.ndarray, px: float, py: float,
         return None
     # 基线用中位数：局部油污、整片台面亮度漂移都只影响中位数以外的少数像素，分位数差因此稳
     highlight = float(np.percentile(patch[m], HIGHLIGHT_PCT) - np.median(patch[m]))
-    has_ball = bool(r_ratio >= BALL_R_RATIO_MIN and highlight >= BALL_HIGHLIGHT_MIN)
+    # 孔级只判"有没有球" = 只看高光。半径比**刻意不参与**本槽判定，它归件级中位数用
+    # (旧写法在这里 AND 了 rr>=0.144，实测把 45/423 张好件判死，见参数区注释)。
+    has_ball = bool(highlight >= BALL_HIGHLIGHT_MIN)
     return hx, hy, hr, r_ratio, highlight, has_ball
 
 
@@ -394,16 +418,28 @@ def inspect_missing(bgr: np.ndarray, name: str = "") -> MissingResult:
         res.ball_r_med = float(np.median([p.r for p in pockets]))
         res.r_ratio_med = float(np.median([p.r_ratio for p in pockets]))
 
-    # ---- ③ 判定：18 个兜孔必须个个"有压到位的球"。量不出来的槽按没球算(fail-safe)。
+    # ---- ③ 判定(两级，见参数区注释)：任何一级不过都判 NG，量不出来的槽按没球算(fail-safe)。
+    #
+    #   孔级(存在性)：18 个兜孔必须个个见球面高光 —— 这是**正面缺球**的判据。
+    #   件级(落座状态)：整圈半径比中位数必须够大 —— 这是**反面浮球 / 定位跑偏**的判据。
+    #     两级量的是两个不同维度，谁也替不了谁：反面浮球时高光照样达标(实测 76.7% 的槽 ≥120)，
+    #     而正面只缺一颗球时中位数几乎不动(rr_med 最高可到 0.165)。所以两道闸都得在。
     n_empty = sum(1 for p in pockets if not p.has_ball) + n_fail
     res.n_empty = n_empty
     if n_empty > MAX_EMPTY_POCKETS:
         res.verdict = NG_EMPTY_POCKET
-        res.reason = ("缺粒: %d/%d 个兜孔未见压到位的球(半径比<%.3f 或 高光<%.0f；其中 %d 个量不出来)"
-                      % (n_empty, N_POCKETS, BALL_R_RATIO_MIN, BALL_HIGHLIGHT_MIN, n_fail))
+        res.reason = ("缺粒: %d/%d 个兜孔未见球面高光(高光<%.0f；其中 %d 个量不出来)"
+                      % (n_empty, N_POCKETS, BALL_HIGHLIGHT_MIN, n_fail))
+    elif res.r_ratio_med < PART_R_RATIO_MED_MIN:
+        # 高光都过了但整圈半径比偏小：球没压到位(反面浮球)，或节圆拟合跑偏(锁到内孔) ——
+        # 两种都不放行。这是**件级**判据，所以 reason 里给的是中位数、不是某个槽。
+        res.verdict = NG_EMPTY_POCKET
+        res.reason = ("整圈未压到位: 半径比中位数 %.3f < %.3f(球未全部压到位，或节圆拟合不可信; "
+                      "相位一致性 %.2f)" % (res.r_ratio_med, PART_R_RATIO_MED_MIN, res.phase_coh))
     else:
         res.verdict = OK_PASS
-        res.reason = "全部 %d 个兜孔均见压到位的球(相位 %.1f°)" % (N_POCKETS, res.phase_deg)
+        res.reason = ("全部 %d 个兜孔均见球面高光，整圈半径比中位数 %.3f(相位 %.1f°)"
+                      % (N_POCKETS, res.r_ratio_med, res.phase_deg))
     return finish()
 
 
@@ -490,10 +526,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log.setLevel(logging.DEBUG)
     log.info("[MISSING] 第二站=兜孔缺粒 | 日志=%s | 结果图 OK=%s / NG=%s | 判定经主程序开闸 D9(放 NG 件落盒)",
              RUNTIME_LOG_DIR, OK_SAVE_DIR, NG_SAVE_DIR)
-    log.info("[MISSING] 二期判据已用 40 张样本标定(良品 3/3 判 OK、缺粒 37/37 判 NG、逃逸 0)："
-             "逐槽 半径比>=%.3f 且 球面高光>=%.0f，%d 个兜孔全须有压到位的球。"
-             "样本量小，上线前须再复跑零逃逸自检。",
-             BALL_R_RATIO_MIN, BALL_HIGHLIGHT_MIN, N_POCKETS)
+    log.info("[MISSING] 二期判据已用 598 张全量样本复跑标定(正面OK 423/正面NG 44/反面NG 44/无件 87；"
+             "过杀 5/423、逃逸 0)：孔级 球面高光>=%.0f(18 个兜孔逐个) ＋ 件级 整圈半径比中位数>=%.3f。"
+             "样本量仍不算大(尤其反面 44 张)，上线前须再复跑零逃逸自检。",
+             BALL_HIGHLIGHT_MIN, PART_R_RATIO_MED_MIN)
+
+    if args.quiet:
+        # 控制台抬到 WARNING：逐帧 [INSPECT-DONE] 这类 INFO 不再经本进程 stdout 冒出来，
+        # 也就不会被主程序 _drain 排空到控制台 —— 但**文件 handler 不动**，逐帧明细照进
+        # data/missing/logs 的 .log(事后对账/verify 都从 .log 读，见 verify_l1_missing)。
+        # 刻意放在上面两条 [MISSING] 启动横幅之后：那两行要留在控制台(经主程序汇聚显示)。
+        # 与 inspector_pure.py:3070 同一手法；--debug 降 logger 门槛与这里抬 handler 门槛正交,
+        # `--quiet --debug` = 明细只进文件、不刷屏(产线组合)。
+        for _h in RUNTIME_LOGGER.handlers:
+            if getattr(_h, "stream", None) is sys.stdout:
+                _h.setLevel(logging.WARNING)
+        print("[日志] 控制台已静默(仅 WARNING+)，完整逐帧明细写入: %s" % RUNTIME_LOG_DIR,
+              flush=True)
 
     try:
         source = build_source(args)
@@ -561,9 +610,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 log.critical("[TIMEOUT-NG] frame=#%d inspect=%.1fms budget=%.1fms raw_verdict=%s"
                              "；仍按NG开闸(fail-safe)", seq, res.elapsed_ms, RESULT_DEADLINE_MS,
                              res.verdict)
-                if consecutive_timeouts >= TIMEOUT_ESCALATE_N:
-                    raise AcquisitionError("连续 %d 帧判定超时(%.0fms 预算)"
-                                           % (consecutive_timeouts, RESULT_DEADLINE_MS))
             else:
                 consecutive_timeouts = 0
 
@@ -579,6 +625,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          seq, name, res.elapsed_ms, actuate(name), reason_text)
                 if args.debug:
                     _save_debug_image(bgr, name, res, False)
+
+            # 升级停线必须放在"开闸已发出之后"：触发停线的这一帧本身也要执行到位，否则它会变成
+            # 一次"判了 NG 却没开闸"的漏放 —— 前 14 帧都正常开闸，偏偏触发停线的第 15 帧没有。
+            # 与第一站同序(inspector_pure.py:3283 先 emit_control 吹气，:3336 才 raise)。
+            # `> 0` 守卫同第一站：0 = 永不自动停线，只做逐帧 fail-safe。
+            if TIMEOUT_ESCALATE_N > 0 and consecutive_timeouts >= TIMEOUT_ESCALATE_N:
+                raise AcquisitionError("连续 %d 帧判定超时(%.0fms 预算)"
+                                       % (consecutive_timeouts, RESULT_DEADLINE_MS))
+
             truth = _truth_from_path(name) if args.mode == "local" else None
             if truth is not None:
                 counts["labeled"] += 1
@@ -608,8 +663,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 # ============================  --debug 叠加图  ============================
 # 配色(BGR)：绿=判有球 / 红=判无球 / 品红=量不出来 / 青=标称槽位 / 黄=节圆 / 蓝=锁相位的实检孔。
 # 颜色只管"判据落在哪一边"，不表达置信度 —— 判据余量看每槽标出来的数字。
-_DBG_COL_BALL = (80, 220, 80)      # 绿：这个槽判"有压到位的球"
-_DBG_COL_EMPTY = (70, 70, 240)     # 红：判"空兜 / 未见球"
+_DBG_COL_BALL = (80, 220, 80)      # 绿：这个槽见球面高光(孔级过)
+_DBG_COL_EMPTY = (70, 70, 240)     # 红：这个槽未见球面高光(孔级不过)
 _DBG_COL_FAIL = (255, 0, 220)      # 品红：切边或精定位失败，一律按无球计
 _DBG_COL_NOMINAL = (230, 200, 60)  # 青：标称槽位(相位合成出来的那个点)
 _DBG_COL_PITCH = (0, 210, 255)     # 黄：节圆与工件中心
@@ -686,9 +741,13 @@ def _draw_slots(bgr: np.ndarray, res: MissingResult, is_ok: bool) -> np.ndarray:
     # 判定摘要压在上下两角：叠加图常被单独拿走对照，不能只有图没有结论。
     # 文字用 ASCII(见 _label 的理由)，但每个数是哪个判据、阈值多少，对着常量区一眼能认出来。
     n_ball = sum(1 for p in res.pockets if p.has_ball)
-    footer = "%s  ball %d/%d  empty %d  n/a %d  %.1fms" % (
+    footer = "%s  ball %d/%d  empty %d  n/a %d  rr_med %.3f  %.1fms" % (
         "OK" if is_ok else "NG", n_ball, N_POCKETS, res.n_empty - res.n_slot_fail,
-        res.n_slot_fail, res.elapsed_ms)
+        res.n_slot_fail, res.r_ratio_med, res.elapsed_ms)
+    if not is_ok and n_ball == N_POCKETS and res.n_slot_fail == 0:
+        # 孔级全绿却判 NG = 件级闸(整圈半径比中位数)拦下的。不标出来，看图的人会以为
+        # "18 个槽全绿怎么还 NG"，反过来怀疑判据坏了。
+        footer += "  [PART rr_med<%.3f]" % PART_R_RATIO_MED_MIN
     if is_ok != res.is_ok:  # 超时兜底把 OK 改判成 NG：脚注标出原始判定
         footer += "  (forced, raw=%s)" % res.verdict
     cv2.putText(vis, "pitch_r=%.1f  phase=%.2fdeg  |z|=%.2f  %s" %
@@ -742,13 +801,13 @@ def _log_summary(log, counts: Dict[str, int], ratios: List[float], highlights: L
     if ratios:
         q = np.percentile(np.asarray(ratios, dtype=np.float64), [0, 1, 25, 50, 75, 99, 100])
         log.info("[SUMMARY-SLOT] 兜孔 %d 个 半径比(球盘/节圆) min/p1/p25/p50/p75/p99/max = %s；"
-                 "判据 %.3f(良品最低 0.152；反面**孔级不隔离**——整圈全在的手动反面 000035 每槽≤0.133，"
-                 "但真反面/NG 有绿槽、半径比可达 0.21，安全靠件级'每张反面≥11 空槽')。",
-                 len(ratios), " / ".join("%.3f" % v for v in q), BALL_R_RATIO_MIN)
+                 "**这是件级判据**，看的是每帧的中位数(下限 %.3f)，不是单槽 —— 单槽半径比对"
+                 "'一颗球坐得多深'太敏感，良品 0.107~0.168 与反面 0.107~0.213 在孔级完全重叠。",
+                 len(ratios), " / ".join("%.3f" % v for v in q), PART_R_RATIO_MED_MIN)
     if highlights:
         q = np.percentile(np.asarray(highlights, dtype=np.float64), [0, 1, 25, 50, 75, 99, 100])
         log.info("[SUMMARY-SLOT] 兜孔 %d 个 球面高光(99分位−中位数) min/p1/p25/p50/p75/p99/max = "
-                 "%s；判据 %.0f(标定样本：良品最低 194)。",
+                 "%s；**这是孔级判据**(下限 %.0f)：空兜 max=81、良品 p1=202，中间是空的。",
                  len(highlights), " / ".join("%.0f" % v for v in q), BALL_HIGHLIGHT_MIN)
     if counts["no_actuator"]:
         log.error("[SUMMARY] ⚠ %d 个 NG 无执行器可开闸，实际未分选", counts["no_actuator"])
