@@ -210,6 +210,9 @@ MAX_EMPTY_POCKETS = 0  # 允许的空兜数(h 级)；0 = 18 个兜孔必须个�
 #      inspector_pure.py:110/111，运行期再改 ip.* 不会追到这里来。
 RESULT_DEADLINE_MS = ip.RESULT_DEADLINE_MS
 TIMEOUT_ESCALATE_N = ip.TIMEOUT_ESCALATE_N  # 连续这么多帧超时 -> 停线；0=永不自动停(纯 fail-safe)
+#      超时**口径**与第一站一致 = **入队 → 判定**(`window_ms`，含排队)，不是纯算法耗时。
+#      两道检查共用这一条钟(主判定 :897、出队过期预筛 :858)，细节见主判定那段注释。
+#      没有入队时间戳的取图源(watch/http/本地文件夹)退回纯计算口径，行为与改前相同。
 
 # ---- 定位：与 inspector_pure.locate_part 同一条链、同一套验收标准，**只改一处** ——
 #      "找外圆当锚"那一步降到 1/4 分辨率，而且它的结果**只当 seed**。
@@ -816,8 +819,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             uno = None
 
     deadline_active = args.mode != "local"  # 本地样本没有触发节拍，不算时限
-    counts = {"ok": 0, "ng": 0, "bad": 0, "timeout": 0, "uno_fail": 0, "no_actuator": 0,
-              "labeled": 0, "hit": 0, "miss": 0}
+    counts = {"ok": 0, "ng": 0, "bad": 0, "timeout": 0, "timeout_backlog": 0,
+              "uno_fail": 0, "no_actuator": 0, "labeled": 0, "hit": 0, "miss": 0}
     consecutive_timeouts = 0
     all_ratios: List[float] = []  # 标定用：全帧兜孔"半径比"汇总
     all_highlights: List[float] = []  # 标定用：全帧兜孔"球面高光"汇总
@@ -844,21 +847,90 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 log.info("[INSPECT-DONE] #%d %s  判定 NG  耗时 0.0ms  [%s]  图像读不出来(无效帧 NG)\n",
                          seq, name, actuate(name))
                 continue
+
+            # --- 出队过期预筛(队列保护/防雪崩)：已在队列堆到过期就**跳过算法** ---
+            #     与第一站 inspector_pure.py:3249 同一条机制。本站是 IO 硬触发，件在往下流，
+            #     队列积压说明**前面若干帧已经超预算**，此刻再把这帧算完只是白烧 CPU ——
+            #     它反正已经赶不上开闸，算出来的读数也不会改变处置(下面照样强制 NG + 开闸)。
+            #     跳过它等于把 CPU 让给还没排到的帧，让积压有机会排空。
+            #     **只在相机模式生效**：LocalFolderSource / WatchFolderSource / HttpCameraSource
+            #     都不设 current_frame_enqueued_at(那是 Vn2000Source 采集线程入队时打的，
+            #     inspector_pure.py:1637)，getattr 取到 None ⇒ 这条分支在离线跑样本与
+            #     全部 L1/L2/对拍闸里**恒不触发**，对既有验收是逐位中性的。
+            enqueued_at = getattr(source, "current_frame_enqueued_at", None)
+            if deadline_active and enqueued_at is not None:
+                age_ms = max(0.0, (time.perf_counter() - float(enqueued_at)) * 1000.0)
+                if age_ms > RESULT_DEADLINE_MS:
+                    res = MissingResult(
+                        name=name, verdict=NG_TIMEOUT,
+                        reason="队列积压 %.1fms > %.1fms，跳过检测强制 NG"
+                               % (age_ms, RESULT_DEADLINE_MS))
+                    counts["ng"] += 1
+                    counts["timeout"] += 1
+                    counts["timeout_backlog"] += 1
+                    consecutive_timeouts += 1
+                    # 先开闸、再记日志：判了 NG 却没开闸 = 逃逸，这是本分支唯一不能出错的地方。
+                    uno_status = actuate(name)
+                    log.critical("[TIMEOUT-NG] cause=queue_backlog frame=#%d queue_wait=%.1fms "
+                                 "budget=%.1fms raw_verdict=(skipped)；仍按NG开闸(fail-safe)",
+                                 seq, age_ms, RESULT_DEADLINE_MS)
+                    # **这里刻意与第一站不同**：第一站的积压分支只写 [TIMEOUT-NG]、不写
+                    # [INSPECT-DONE]，但本站的验证工具链是按"每个 NG 恰好一条 [INSPECT-DONE]
+                    # 判定 NG"对账的(verify_common.parse_frames 收逐帧序列、
+                    # verify_l2_pipeline.check_actuation 拿 [SUMMARY] NG= 与 D9 脉冲数对钉)，
+                    # 少一行会让帧序列与开闸次数对不上。所以照常补一行，耗时如实记 0.0ms
+                    # (确实一点没算)，原因写在后面。
+                    log.info("[INSPECT-DONE] #%d %s  判定 NG  耗时 0.0ms  [%s]  %s\n",
+                             seq, name, uno_status, res.reason)
+                    if args.debug:
+                        _save_debug_image(bgr, name, res, False)
+                    # 升级停线必须放在"开闸已发出之后"：触发停线的这一帧本身也要执行到位，
+                    # 否则它会变成一次"判了 NG 却没开闸"的漏放。与下面算法超时分支同序
+                    # (那里也有一份一模一样的守卫，注释见其上方)。
+                    if TIMEOUT_ESCALATE_N > 0 and consecutive_timeouts >= TIMEOUT_ESCALATE_N:
+                        raise AcquisitionError("连续 %d 帧判定超时(%.0fms 预算)"
+                                               % (consecutive_timeouts, RESULT_DEADLINE_MS))
+                    continue
+
             res = inspect_missing(bgr, name)
+            decision_at = time.perf_counter()
             all_ratios.extend(p.r_ratio for p in res.pockets)
             all_highlights.extend(p.highlight for p in res.pockets)
             is_ok = res.is_ok
             reason_text = res.reason
-            if deadline_active and res.elapsed_ms > RESULT_DEADLINE_MS:
+
+            # --- 超时口径 = **入队 → 判定**(含排队)，与第一站 inspector_pure.py:3296 同一条钟 ---
+            # 第一站算的是 window_ms，本站此前算的是 res.elapsed_ms(纯算法时间、不含排队)，
+            # 于是"排队等了 180ms + 算了 40ms = 总 220ms"这种帧两边都漏：上面的出队预筛只在
+            # **出队时就已经过期**才触发(180 < 200 时不触发)，而 elapsed_ms=40 < 200 也不触发。
+            # 可件等的是**总延迟**，不是算法耗时 —— 总延迟越线时这一件本来就赶不上开闸了，
+            # 该按 NG 处置。改成窗口口径后：
+            #   window_ms = queue_wait + elapsed_ms ≥ elapsed_ms  恒成立
+            #   ⇒ 新判据是旧判据的**超集**，只会把原来漏掉的帧补判成 NG，绝不会少判一件。
+            #     方向单向安全(只增 NG = 过杀方向)，符合"零逃逸不让步、过杀可接受"。
+            # 没有入队时间戳的取图源(watch/http/本地文件夹)退回纯计算口径 ⇒ 行为与改前逐位相同，
+            # 所以 L1/L2/598 帧对拍(全 `--mode local`，且本地模式 deadline_active=False)不受影响。
+            if enqueued_at is not None:
+                window_ms = max(0.0, (decision_at - float(enqueued_at)) * 1000.0)
+                queue_wait_ms = max(0.0, window_ms - res.elapsed_ms)
+            else:
+                window_ms = res.elapsed_ms
+                queue_wait_ms = 0.0
+
+            if deadline_active and window_ms > RESULT_DEADLINE_MS:
                 # 判定来不及 -> 这一件多半已经来不及开闸，但绝不放行：仍按 NG 处置并记醒目日志
                 is_ok = False
                 counts["timeout"] += 1
                 consecutive_timeouts += 1
-                reason_text = "超时 %.1fms > %.1fms预算(原判 %s)" % (
-                    res.elapsed_ms, RESULT_DEADLINE_MS, res.verdict)
-                log.critical("[TIMEOUT-NG] frame=#%d inspect=%.1fms budget=%.1fms raw_verdict=%s"
-                             "；仍按NG开闸(fail-safe)", seq, res.elapsed_ms, RESULT_DEADLINE_MS,
-                             res.verdict)
+                reason_text = "超时 %.1fms(含排队 %.1fms) > %.1fms预算(原判 %s)" % (
+                    window_ms, queue_wait_ms, RESULT_DEADLINE_MS, res.verdict)
+                # 三个量都记：只看 inspect 会误判成"算法慢"，只看 window 又不知道慢在哪。
+                # cause 仍叫 algo_slow 与第一站对齐(那边也用它涵盖"算完了但窗口越线")，
+                # 真正区分"排队型 / 计算型"的是 queue_wait 与 inspect 两个数。
+                log.critical("[TIMEOUT-NG] cause=algo_slow frame=#%d queue_wait=%.1fms inspect=%.1fms"
+                             " window=%.1fms budget=%.1fms raw_verdict=%s；仍按NG开闸(fail-safe)",
+                             seq, queue_wait_ms, res.elapsed_ms, window_ms,
+                             RESULT_DEADLINE_MS, res.verdict)
             else:
                 consecutive_timeouts = 0
 
@@ -1046,11 +1118,11 @@ def _truth_from_path(name: str) -> Optional[bool]:
 def _log_summary(log, counts: Dict[str, int], ratios: List[float], highlights: List[float],
                  tally: Dict[str, List[int]], elapsed_s: float, args) -> None:
     """停机汇总。除常规计数外，打出两个判据量的分位分布 —— 下次复标定直接看这两条。"""
-    log.info("[SUMMARY] processed=%d OK=%d NG=%d invalid=%d timeout_ng=%d "
+    log.info("[SUMMARY] processed=%d OK=%d NG=%d invalid=%d timeout_ng=%d timeout_backlog=%d "
              "uno_fail=%d no_actuator=%d elapsed=%.2fs",
              counts["ok"] + counts["ng"] + counts["bad"], counts["ok"], counts["ng"],
-             counts["bad"], counts["timeout"], counts["uno_fail"], counts["no_actuator"],
-             elapsed_s)
+             counts["bad"], counts["timeout"], counts["timeout_backlog"], counts["uno_fail"],
+             counts["no_actuator"], elapsed_s)
     if ratios:
         q = np.percentile(np.asarray(ratios, dtype=np.float64), [0, 1, 25, 50, 75, 99, 100])
         log.info("[SUMMARY-SLOT] 兜孔 %d 个 半径比(球盘/节圆) min/p1/p25/p50/p75/p99/max = %s；"
