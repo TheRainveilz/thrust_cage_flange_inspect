@@ -66,17 +66,21 @@
 | 脚本 | 干嘛 | 怎么跑 |
 |---|---|---|
 | `_missing_equiv.py` | **回归闸：改过第二站算法必跑。** 598 帧全量快照（判定 + 每槽半径比/高光）：改前存 `before`、改后存 `<tag>`、再 `cmp`，要求**判定逐帧不劣化 + 逃逸恒为 0 + 正面OK 过杀不增加**。可临时覆盖两个候选加速开关来隔离变量 | `python tools/_missing_equiv.py before\|<tag>\|cmp before <tag>`，覆盖写法 `... <tag> <降采样> <跳首遍0/1>` |
+| `_missing_backlog_selftest.py` | **「出队过期预筛」自检（改过 `inspector_missing.main()` 主循环必跑）**：假图源把 `current_frame_enqueued_at` 打旧，逼出那条"跳过算法直接判 NG 开闸"的分支，验四条不变量：判NG必开闸 / 一帧不丢 / 触发停线那帧也已开闸 / 没判过期的帧照常算。**L1·L2·598帧对拍都碰不到这条分支**（它只在相机模式生效），只有这个脚本能证它 | `python tools/_missing_backlog_selftest.py`（要 cv2；不碰串口/IPC/真目录） |
 | `_missing_hough_probe.py` | 两个候选加速开关值不值得开：首遍严阈值 `p2=55` 的命中率、候选数分布 | `python tools/_missing_hough_probe.py` → `_hough_probe.txt` |
 | `_missing_prof.py` | 单帧耗时分解（preprocess / 找孔候选 / 定位 / refine / 逐槽），改完再量瓶颈在哪 | `python tools/_missing_prof.py` → `_timing_missing.txt` |
 | `_missing_micro.py` | 微基准：整幅 `astype` 开销 / Hough 各分辨率 / 掩膜建图 —— `_F32View` 与掩膜缓存的立论依据 | `python tools/_missing_micro.py` → `_micro_missing.txt` |
 | `_missing_back_final.py` | `反面/NG` 全 44 张按用户 2026-10-02 定性分类 + 两级闸各拦下几张 | `python tools/_missing_back_final.py` → `_back_final.txt` |
 | `_missing_sweep.py` | 全量逐帧逐槽落盘成 JSON（其余分布分析的源头） | `python tools/_missing_sweep.py` |
 
-> ⚠ 两条：
+> ⚠ 三条：
 > **①`_equiv_before.json` / `_equiv_before_t.json` 是 `cmp` 的冻结基线，别删。**它是改优化前的 598 帧快照
 > （中位 72.72ms），任何后续改动都拿它比。
 > **②`_missing_equiv.py` 的前 4 行常量目录指向产线机外的 `I:/data.zip/data/missing/Class/`**（598 帧），
 > 换机器要改。它被 `inspector_missing.py` 的 `detect_hole_candidates_fast` / `_F32View` 注释**点名要求重跑**。
+> **③「出队过期预筛」只有 `_missing_backlog_selftest.py` 能验，别拿 L1/L2/598 帧对拍替它。**
+> 那条分支靠 `current_frame_enqueued_at`（只在 `Vn2000Source` 相机模式有值），而 L1/L2 与全量对拍
+> 全跑 `--mode local` ⇒ 对它**恒不触发**，它们绿只说明"没改坏既有判定"，不说明"这条分支是对的"。
 
 ---
 
