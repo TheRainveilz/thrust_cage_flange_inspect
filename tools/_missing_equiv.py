@@ -29,6 +29,11 @@ DIRS = ["正面/OK", "正面/NG", "反面/NG", "无件"]
 TAG = sys.argv[1] if len(sys.argv) > 1 else "before"
 # 可选：临时覆盖两个候选加速开关，用来隔离"降采样"与"跳严阈值"各自的影响。
 #   python tools/_missing_equiv.py d1s1 1 0   → CAND_DOWNSCALE=1 / CAND_SKIP_FIRST_PASS=False
+#
+# ⚠ 冻结基线 `_equiv_before.json` 是**两关**(d1s0)下拍的。2026-10-03 起 `inspector_missing`
+#   的默认值翻成"降采样关 + 跳首遍**开**" ⇒ **裸跑 `... <tag>` 拍到的已经不是 before 那一档了**，
+#   拿它去 `cmp before` 会把"开关变了"读成"算法坏了"(或反过来把真回归读成开关差)。
+#   **要跟冻结基线比，必须显式给参数**：`... <tag> 1 0`(对齐基线) / `... <tag> 1 1`(跳首遍)。
 if TAG != "cmp" and len(sys.argv) > 3:
     im.CAND_DOWNSCALE = int(sys.argv[2])
     im.CAND_SKIP_FIRST_PASS = bool(int(sys.argv[3]))
